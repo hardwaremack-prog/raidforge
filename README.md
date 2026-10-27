@@ -5,7 +5,8 @@ put your drives on a HAT, and build a RAID 0, 1, 5, 6 or 10 array without touchi
 
 ## Install
 ```bash
-unzip raidforge.zip && cd raidforge
+git clone https://github.com/hardwaremack-prog/raidforge
+cd raidforge
 bash install.sh
 ```
 Then open **Menu → System Tools → RAID Forge**. Use **RAID Forge (Demo)** first to try it with fake drives.
