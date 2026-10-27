@@ -3,12 +3,21 @@
 Point-and-click software RAID for the Raspberry Pi 5, Pi 500 and Pi 400. Boot Pi OS from the SD card,
 put your drives on a HAT, and build a RAID 0, 1, 5, 6 or 10 array without touching the terminal.
 
+![RAID Forge: RAID 1 on a Pironman 5-MAX](docs/setup.png)
+
+| | |
+|:---:|:---:|
+| ![My Arrays](docs/my-arrays.png) | ![Move system to RAID](docs/move-system-to-raid.png) |
+| **My Arrays**: live rebuild progress, drive swaps, scrubs | **Move system to RAID**: the SD card only starts the Pi |
+
 ## Install
 ```bash
 git clone https://github.com/hardwaremack-prog/raidforge
 cd raidforge
 bash install.sh
 ```
+Or download the zip, unzip it and run `bash install.sh` inside the `raidforge` folder.
+
 Then open **Menu → System Tools → RAID Forge**. Use **RAID Forge (Demo)** first to try it with fake drives.
 
 ## What it does
