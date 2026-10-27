@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RAID Forge — point-and-click software RAID for Raspberry Pi 5 / Pi 500.
+RAID Forge — point-and-click software RAID for Raspberry Pi 5 / Pi 500 / Pi 400.
 
 Boot the Pi from its SD card, plug drives into a HAT (SATA, NVMe or USB),
 and build a Linux mdadm RAID 0, 1, 5, 6 or 10 array with a filesystem,
@@ -66,7 +66,7 @@ HATS = [
     ("Radxa Penta SATA HAT", "Up to 5 SATA drives over PCIe. Needs PCIe enabled and its own 12 V power."),
     ("Dual NVMe HAT (Pimoroni Duo, Geekworm X1004 …)", "2 NVMe drives behind a PCIe switch. Use PCIe Gen 2."),
     ("Quad NVMe HAT (PCIe switch)", "Up to 4 NVMe drives behind a PCIe switch. Use PCIe Gen 2."),
-    ("USB 3 drives / USB HAT / dock", "Works on Pi 5 and Pi 500. Use a powered hub or dock for 2.5\"/3.5\" drives."),
+    ("USB 3 drives / USB HAT / dock", "Works on Pi 5, Pi 500 and Pi 400 (blue USB 3 ports). Use a powered hub or dock for 2.5\"/3.5\" drives."),
 ]
 
 
@@ -396,7 +396,7 @@ class App(tk.Tk):
         t = tk.Frame(h, bg=BG)
         t.pack(side="left", padx=10)
         tk.Label(t, text=APP, bg=BG, fg=FG, font=("DejaVu Sans", 17, "bold")).pack(anchor="w")
-        tk.Label(t, text="Software RAID for Raspberry Pi 5 / Pi 500 — boot from SD, store on the HAT",
+        tk.Label(t, text="Software RAID for Raspberry Pi 5 / 500 / 400 — boot from SD, store on the HAT or USB",
                  bg=BG, fg=MUTED).pack(anchor="w")
         if DEMO:
             tk.Label(h, text=" DEMO ", bg=WARN, fg="black", font=("DejaVu Sans", 10, "bold")).pack(side="right")
@@ -733,10 +733,11 @@ class App(tk.Tk):
         self.chk_labels["tools"].configure(text="mdadm ready ✓" if tools else "mdadm not installed",
                                            fg=GOOD if tools else BAD)
         self.btn_tools.state(["disabled"] if tools else ["!disabled"])
-        is500 = "Pi 500" in b
         is500plus = "500+" in b or "500 Plus" in b
-        if is500 and not is500plus:
-            txt, col = "Pi 500 has no PCIe connector —\nuse USB 3 drives/docks", WARN
+        has_pcie = is500plus or bool(re.search(r"Pi 5\b|Compute Module 5", b))
+        if not has_pcie:
+            short = re.sub(r"^Raspberry\s+|\s+Rev.*$", "", b) or "This board"
+            txt, col = f"{short} has no PCIe connector —\nuse USB 3 drives/docks", WARN
             self.btn_pcie.state(["disabled"])
         else:
             en, gen = pc["config"]
