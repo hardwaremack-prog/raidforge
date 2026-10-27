@@ -40,8 +40,13 @@ Then open **Menu → System Tools → RAID Forge**. Use **RAID Forge (Demo)** fi
 - **Boot from SD again…** puts the original `cmdline.txt` back. If the Pi ever won't start, put the SD card in another
   computer and copy `cmdline.txt.raidforge-sd` over `cmdline.txt` (see `RAID-FORGE-README.txt` on the card)
 - Use RAID 1 (or 5/6/10) for this: on RAID 0 one dead drive takes the whole system with it
+- **Low-wear** option: moves swap from a file on the drives into compressed RAM (zram)
 
-**③ Drive Health** — SMART pass/fail, temperature, power-on hours, reallocated/pending sectors, NVMe wear
+**③ Drive Health**: SMART pass/fail, temperature, power-on hours, bad sectors, and **SSD wear** (NVMe and SATA SSDs),
+with warnings at 60% / 80% and a flag for mirror pairs wearing in step. Its **TRIM** panel runs TRIM weekly
+(recommended), daily or not at all, has a **TRIM now** button, and shows which drives, USB enclosures and arrays support it.
+
+![Drive Health: SSD wear and TRIM](docs/drive-health.png)
 
 ## Hardware notes
 | Setup | Notes |
@@ -55,6 +60,6 @@ Then open **Menu → System Tools → RAID Forge**. Use **RAID Forge (Demo)** fi
 
 Minimum drives: RAID 0 / 1 → 2, RAID 5 → 3, RAID 6 / 10 → 4 (RAID 10 even numbers only).
 
-**📈 Speeds, Gen 2 vs Gen 3, "does RAID 1 double reads?", and recommended setups: see [SPEED-GUIDE.md](SPEED-GUIDE.md).**
+**📈 Speeds, Gen 2 vs Gen 3, "does RAID 1 double reads?", SSD wear and TRIM, and recommended setups: see [SPEED-GUIDE.md](SPEED-GUIDE.md).**
 
 RAID is not a backup — keep a copy of anything important somewhere else.

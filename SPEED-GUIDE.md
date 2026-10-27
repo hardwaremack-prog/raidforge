@@ -1,4 +1,4 @@
-# RAID Forge speed & hardware guide
+# RAID Forge speed, wear & hardware guide
 
 What speeds to expect from NVMe, SATA and USB drives on a Raspberry Pi 5, and which RAID level makes sense.
 
@@ -42,6 +42,47 @@ Even at 450 MB/s, NVMe is about 5× faster than an SD card. Its fast response to
 If the PCIe lane is already full (dual NVMe behind a Gen 2 switch), none of this shows up. RAID 1 runs at about one drive's speed. Choose RAID 1 because **a dead drive doesn't take your system or files with it**, not for speed.
 
 RAID 0 on a shared lane barely helps either. One review measured ~425 MB/s for RAID 0 vs ~410 MB/s for a single drive, while RAID 0 doubles the risk.
+
+## SSD wear, wear levelling and TRIM
+
+**RAID doesn't interfere with wear levelling.** Each SSD spreads writes across its own flash internally. Linux
+RAID sits above that and just sends normal reads and writes, so every drive still levels itself.
+
+**RAID 1's quirk: both mirrors wear together.** A mirror writes the same data to both drives, so a matching pair
+reaches its write limit at about the same time. Ways around it:
+- Use two different models, or drives of different ages.
+- Watch **SSD wear** on the Drive Health tab. RAID Forge warns at 60% and 80%, and flags mirror pairs
+  that are wearing in step.
+- Replace one drive early (My Arrays > Replace a drive) so the pair gets out of step.
+
+**How much wear to expect.** A typical 1 TB NVMe drive is rated for about 600 TB written. A Pi running its system
+plus light NAS use writes roughly 5–20 GB a day, which works out to decades. Wear only becomes a real factor with
+heavy constant writing, like security cameras or databases.
+
+**The RAID level makes a difference:**
+| Level | Writes per drive |
+|---|---|
+| RAID 1 / 10 | Same as a single drive (plus one full write during the first sync) |
+| RAID 5 / 6 | More: small writes also update parity. Fine for big files, less ideal for a system drive |
+| Monthly `mdadm` check | Reads only, so no wear |
+
+**TRIM** tells an SSD which blocks are free, so it doesn't keep moving deleted data around. RAID Forge's
+Drive Health tab has the controls:
+- **Run automatically: Weekly (recommended) / Daily / Off.** Weekly is plenty for most Pis, because TRIM only
+  clears blocks freed since the last run. Daily is harmless on NVMe and helps if you delete lots of data often
+  (camera footage, big downloads). Daily adds a systemd override at
+  `/etc/systemd/system/fstrim.timer.d/raidforge.conf`.
+- **TRIM now** runs it straight away on every mounted SSD.
+- It checks each drive: NVMe on the Pi 5's PCIe connector supports TRIM, many **USB enclosures don't pass it
+  through** (it says so), RAID 0/1/10 pass it to the drives, and **RAID 5/6 blocks it by default** for safety.
+- RAID Forge uses scheduled TRIM, not the `discard` mount option, which can slow down every delete.
+
+**Fewer writes:**
+- Newly built arrays and moved systems mount with `noatime`, so reading a file doesn't cause a write.
+- **Move system to RAID > Low-wear** moves swap from a file on the drive (dphys-swapfile) into compressed RAM
+  (zram). Systems that already use zram (as Trixie does) are left as they are.
+- After **Move system to RAID**, the SD card is only written when a kernel update lands in the boot partition.
+  SD cards have the weakest wear levelling of all, so this is the biggest win for reliability.
 
 ## SunFounder Pironman 5-MAX (dual NVMe case)
 

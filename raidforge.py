@@ -23,7 +23,7 @@ import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 
 APP = "RAID Forge"
-VERSION = "1.1"
+VERSION = "1.2"
 DEMO = "--demo" in sys.argv or os.environ.get("RAIDFORGE_DEMO") == "1"
 USER = os.environ.get("SUDO_USER") or getpass.getuser()
 
@@ -67,6 +67,49 @@ def edit_cmdline(text, fs_uuid, fstype):
     """cmdline.txt is one line: point root= at the array and make sure the kernel waits for it."""
     parts = [p for p in text.split() if not p.startswith(("root=", "rootfstype=", "rootwait"))]
     return " ".join([f"root=UUID={fs_uuid}", f"rootfstype={fstype}", "rootwait"] + parts) + "\n"
+
+
+def wear_from_smart(j):
+    """Percent of rated life used, from smartctl -j output (NVMe or SATA SSD). None if unknown."""
+    nv = j.get("nvme_smart_health_information_log", {})
+    if nv.get("percentage_used") is not None:
+        return int(nv["percentage_used"])
+    ds = j.get("ata_device_statistics", {})
+    for page in ds.get("pages", []) or []:
+        for t in page.get("table", []) or []:
+            if "Endurance" in (t.get("name") or "") and t.get("value") is not None:
+                return int(t["value"])
+    # vendor attributes: normalized value counts DOWN from 100 as the flash wears
+    for attr in j.get("ata_smart_attributes", {}).get("table", []):
+        if attr.get("id") in (177, 231, 233, 202) and attr.get("value") is not None and 0 < attr["value"] <= 100:
+            return 100 - int(attr["value"])
+    return None
+
+
+def disk_of(dev):
+    """md member name -> whole disk (nvme0n1p1 -> nvme0n1, sda1 -> sda)."""
+    return re.sub(r"p\d+$", "", dev) if re.match(r"(nvme|mmcblk)", dev) else re.sub(r"\d+$", "", dev)
+
+
+def lockstep_warnings(arrays, wear):
+    """Mirrored SSDs that have worn to within 5% of each other (and past 30%) may wear out together."""
+    out = []
+    for a in arrays:
+        if a["level"] not in ("raid1", "raid10"):
+            continue
+        vals = sorted((wear[disk_of(d)], disk_of(d)) for d, s in a["devices"]
+                      if s == "active" and wear.get(disk_of(d)) is not None)
+        for (w1, d1), (w2, d2) in zip(vals, vals[1:]):
+            if w2 >= 30 and w2 - w1 <= 5:
+                out.append(f"{a['name']}: {d1} ({w1}%) and {d2} ({w2}%) are wearing in step. Consider replacing "
+                           f"one early (My Arrays > Replace a drive) so they don't wear out together.")
+    return out
+
+
+TRIM_OVERRIDE = "/etc/systemd/system/fstrim.timer.d/raidforge.conf"
+TRIM_DAILY = ("# Added by RAID Forge: TRIM every day instead of every week\n"
+              "[Timer]\nOnCalendar=\nOnCalendar=daily\nAccuracySec=1h\nRandomizedDelaySec=30min\nPersistent=true\n")
+ZRAM_CONF = "# Added by RAID Forge (low-wear): swap lives in compressed RAM, not on the drives\nALGO=zstd\nPERCENT=50\nPRIORITY=100\n"
 
 
 def ensure_initramfs(config_text):
@@ -1002,7 +1045,7 @@ class App(tk.Tk):
             rc, out = S.run(["blkid", "-s", "UUID", "-o", "value", md], root=True, quiet=True)
             fsuuid = out.strip() or ("demo-fs-uuid" if DEMO else "")
             if fsuuid:
-                opts = "defaults,nofail,x-systemd.device-timeout=30s"
+                opts = "defaults,noatime,nofail,x-systemd.device-timeout=30s"
                 fst = f"UUID={fsuuid}  {p['mount']}  {p['fs']}  {opts}  0  {2 if p['fs'] == 'ext4' else 0}  # RAID Forge {name}\n"
                 S.write_root_file("/etc/fstab", fst, append=True)
             if DEMO or shutil.which("update-initramfs"):
@@ -1304,7 +1347,7 @@ class App(tk.Tk):
         """Returns (items, info). items: [(state, text)] with state ok/warn/bad."""
         S, items = self.sys, []
         md = f"/dev/{a['name']}"
-        info = dict(md=md, fstype="ext4", fs_uuid="", nonempty=0, need_tools=[], need_initramfs=False,
+        info = dict(md=md, fstype="ext4", fs_uuid="", nonempty=0, need_tools=[], need_initramfs=False, swap="none",
                     unformatted=False)
         add = lambda st, t: items.append((st, t))
         if DEMO:
@@ -1315,7 +1358,8 @@ class App(tk.Tk):
             add("ok", f"Needs about {human(used * 1.15)}, the array has {human(size)}")
             add("warn", "The array has 3 files/folders on it, so it must be erased first")
             add("ok", "Startup files (initramfs) are on and will include RAID support")
-            info.update(fs_uuid="demo-fs-uuid", nonempty=3, used=used)
+            add("warn", "Swap is a file on the drive (dphys-swapfile). The low-wear option moves it into RAM (zram)")
+            info.update(fs_uuid="demo-fs-uuid", nonempty=3, used=used, swap="dphys")
             return items, info
 
         src = S.root_source()
@@ -1388,6 +1432,13 @@ class App(tk.Tk):
             add("warn", "Startup files (initramfs) are off. They'll be turned on so the Pi can find the RAID")
         else:
             add("ok", "Startup files (initramfs) are on and will include RAID support")
+        rc, sw = S.run(["swapon", "--show=NAME", "--noheadings"], quiet=True)
+        if "zram" in sw:
+            info["swap"] = "zram"
+            add("ok", "Swap already lives in RAM (zram), so it won't wear the drives")
+        elif S.has("dphys-swapfile") or os.path.exists("/etc/dphys-swapfile"):
+            info["swap"] = "dphys"
+            add("warn", "Swap is a file on the drive (dphys-swapfile). The low-wear option moves it into RAM (zram)")
         return items, info
 
     def migrate_wizard(self):
@@ -1414,6 +1465,9 @@ class App(tk.Tk):
 
         erase = tk.BooleanVar(value=False)
         er = ttk.Checkbutton(win, text="Erase everything on the array first", variable=erase)
+        lowwear = tk.BooleanVar(value=True)
+        lw = ttk.Checkbutton(win, variable=lowwear,
+                             text="Low-wear: keep swap in compressed RAM (zram) instead of a file on the drives")
         prog = ttk.Progressbar(win, mode="determinate", maximum=100)
         stat = tk.Label(win, text="", bg=PANEL, fg=MUTED, anchor="w", justify="left", wraplength=720)
         bf = tk.Frame(win, bg=PANEL)
@@ -1438,6 +1492,8 @@ class App(tk.Tk):
                          font=("DejaVu Sans", 11, "bold")).pack(side="left")
                 tk.Label(r, text=text, bg=CARD, fg=FG, justify="left", wraplength=660, anchor="w").pack(side="left")
             state.update(items=items, info=info)
+            if info["swap"] == "dphys":
+                lw.pack(anchor="w", padx=18)
             if info["nonempty"] or info["unformatted"]:
                 erase.set(bool(info["unformatted"]))
                 er.pack(anchor="w", padx=18)
@@ -1476,9 +1532,10 @@ class App(tk.Tk):
                 return
             go.state(["disabled"])
             er.state(["disabled"])
+            lw.state(["disabled"])
 
             def job():
-                ok = self._do_migrate(a, info, erase.get(), setp)
+                ok = self._do_migrate(a, info, erase.get(), setp, lowwear.get())
                 if ok:
                     self.ui(lambda: self._offer_reboot_msg(
                         "The system is copied and the Pi is set to run from RAID.\n\nReboot now?", parent=win))
@@ -1489,7 +1546,7 @@ class App(tk.Tk):
         if messagebox.askyesno(APP, text, parent=parent or self):
             self.sys.run(["systemctl", "reboot"], root=True)
 
-    def _do_migrate(self, a, info, erase, setp):
+    def _do_migrate(self, a, info, erase, setp, lowwear=False):
         S, md = self.sys, info["md"]
 
         def fail(text):
@@ -1534,6 +1591,19 @@ class App(tk.Tk):
         if um and um.group(1) not in S.read_text(MDADM_CONF):
             S.run(["mkdir", "-p", os.path.dirname(MDADM_CONF)], root=True, quiet=True)
             S.write_root_file(MDADM_CONF, line + "\n", append=True)
+
+        if lowwear and info.get("swap") == "dphys":
+            setp(9, "Low-wear: moving swap into RAM (zram)…")
+            rc, _ = S.run(["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y",
+                           "--no-install-recommends", "zram-tools"], root=True, timeout=1200)
+            if rc == 0 or DEMO:
+                S.write_root_file("/etc/default/zramswap", ZRAM_CONF)
+                S.run(["systemctl", "enable", "zramswap"], root=True)
+                # keep today's swap running until the reboot; just stop it coming back
+                S.run(["systemctl", "disable", "dphys-swapfile"], root=True)
+                self.log("✓ Low-wear: swap moves into RAM (zram) from the next boot.", "good")
+            else:
+                self.log("Couldn't install zram-tools. Carrying on with the swap file (wear is still fine).", "warn")
 
         setp(10, "Copying the system… (this is the long part)")
         if DEMO:
@@ -1652,61 +1722,210 @@ class App(tk.Tk):
         top = ttk.Frame(root, style="Bg.TFrame")
         top.pack(fill="x", pady=(10, 6))
         ttk.Button(top, text="Check all drives (SMART)", command=self.check_health).pack(side="left")
-        ttk.Label(top, text="Reads each drive's self-monitoring data. USB enclosures may not pass it through.",
+        ttk.Label(top, text="Health, temperature and SSD wear. Some USB enclosures don't pass this through.",
                   foreground=MUTED).pack(side="left", padx=10)
-        cols = ("drive", "model", "health", "temp", "hours", "notes")
+
+        # TRIM panel (packed at the bottom first so the table takes the rest)
+        tp = ttk.Frame(root, style="Panel.TFrame", padding=12)
+        tp.pack(side="bottom", fill="x", pady=(8, 0))
+        hdr = ttk.Frame(tp, style="Panel.TFrame")
+        hdr.pack(fill="x")
+        ttk.Label(hdr, text="TRIM", style="H.Panel.TLabel").pack(side="left")
+        ttk.Label(hdr, text="  tells SSDs which blocks are free, so they stay fast and wear evenly",
+                  style="Muted.Panel.TLabel").pack(side="left")
+        ttk.Button(hdr, text="TRIM now", command=self.trim_now).pack(side="right")
+        ttk.Button(hdr, text="Apply", command=self.apply_trim).pack(side="right", padx=6)
+        self.trim_sched = tk.StringVar(value="Weekly (recommended)")
+        ttk.Combobox(hdr, textvariable=self.trim_sched, state="readonly", width=20,
+                     values=["Weekly (recommended)", "Daily", "Off"]).pack(side="right")
+        ttk.Label(hdr, text="Run automatically:", style="Muted.Panel.TLabel").pack(side="right", padx=6)
+        self.trim_info = tk.Label(tp, text="Checking…", bg=PANEL, fg=MUTED, justify="left", anchor="w",
+                                  wraplength=1100, font=("DejaVu Sans", 9))
+        self.trim_info.pack(fill="x", pady=(8, 0))
+
+        self.wear_msg = tk.Label(root, text="", bg=BG, fg=WARN, justify="left", anchor="w", wraplength=1100)
+        self.wear_msg.pack(side="bottom", fill="x", pady=(6, 0))
+        cols = ("drive", "model", "health", "wear", "temp", "hours", "notes")
         self.htree = ttk.Treeview(root, columns=cols, show="headings", selectmode="none")
-        for c, t, w in zip(cols, ("Drive", "Model", "Health", "Temp", "Power-on hours", "Notes"),
-                           (120, 240, 110, 80, 130, 340)):
+        for c, t, w in zip(cols, ("Drive", "Model", "Health", "SSD wear", "Temp", "Power-on hours", "Notes"),
+                           (110, 220, 90, 150, 70, 110, 330)):
             self.htree.heading(c, text=t)
             self.htree.column(c, width=w, anchor="w")
         self.htree.tag_configure("good", foreground=GOOD)
         self.htree.tag_configure("bad", foreground=BAD)
         self.htree.tag_configure("warn", foreground=WARN)
         self.htree.pack(fill="both", expand=True)
+        self.after(600, self.refresh_trim)
+
+    @staticmethod
+    def wear_text(w):
+        if w is None:
+            return "—", None
+        bar = "█" * min(10, round(w / 10)) + "░" * (10 - min(10, round(w / 10)))
+        return f"{bar} {w}%", ("bad" if w >= 80 else "warn" if w >= 60 else None)
 
     def check_health(self):
         def job():
-            rows = []
+            rows, wear = [], {}
             for d in self.sys.disks():
                 if d["tran"] == "mmc":
                     continue
                 if DEMO:
-                    rows.append((d["path"], d["model"], "PASSED", "34 °C", "8,812", "", "good"))
+                    w = {"sda": 81, "sdb": 79, "sdc": 12, "sdd": 3, "sde": None}.get(d["name"])
+                    wear[d["name"]] = w
+                    wt, wtag = self.wear_text(w)
+                    note = ("replace soon: over 80% of rated writes used" if wtag == "bad" else
+                            "past 60%: plan a replacement" if wtag == "warn" else "")
+                    rows.append((d["path"], d["model"], "PASSED", wt, "34 °C", "8,812", note, wtag or "good"))
                     continue
-                args = ["smartctl", "-H", "-A", "-j", d["path"]]
+                args = ["smartctl", "-H", "-A", "-l", "devstat", "-j", d["path"]]
                 if d["tran"] == "usb":
                     args[1:1] = ["-d", "sat"]
                 rc, out = self.sys.run(args, root=True, quiet=True)
                 try:
                     j = json.loads(out)
                 except ValueError:
-                    rows.append((d["path"], d["model"], "unknown", "—", "—", "smartctl not available", "warn"))
+                    rows.append((d["path"], d["model"], "unknown", "—", "—", "—", "smartctl not available", "warn"))
                     continue
                 passed = j.get("smart_status", {}).get("passed")
                 temp = j.get("temperature", {}).get("current")
                 hrs = j.get("power_on_time", {}).get("hours")
+                w = None if d["rota"] else wear_from_smart(j)
+                wear[d["name"]] = w
+                wt, wtag = self.wear_text(w)
                 notes = []
+                if wtag == "bad":
+                    notes.append("replace soon: over 80% of rated writes used")
+                elif wtag == "warn":
+                    notes.append("past 60%: plan a replacement")
                 for attr in j.get("ata_smart_attributes", {}).get("table", []):
                     if attr.get("id") in (5, 197, 198) and attr.get("raw", {}).get("value", 0):
                         notes.append(f"{attr['name']}={attr['raw']['value']}")
                 nv = j.get("nvme_smart_health_information_log", {})
-                if nv.get("percentage_used") is not None:
-                    notes.append(f"wear {nv['percentage_used']}%")
                 if nv.get("media_errors"):
                     notes.append(f"media errors {nv['media_errors']}")
+                if nv.get("available_spare") is not None and nv.get("available_spare_threshold") is not None \
+                        and nv["available_spare"] <= nv["available_spare_threshold"]:
+                    notes.append("spare blocks used up")
                 health = "PASSED" if passed else ("FAILING" if passed is False else "unknown")
-                tag = "bad" if passed is False else ("warn" if any("=" in n for n in notes) else "good")
-                rows.append((d["path"], d["model"], health, f"{temp} °C" if temp else "—",
+                tag = "bad" if passed is False or wtag == "bad" else \
+                    ("warn" if wtag == "warn" or any("=" in n or "media" in n for n in notes) else "good")
+                rows.append((d["path"], d["model"], health, wt, f"{temp} °C" if temp else "—",
                              f"{hrs:,}" if hrs else "—", ", ".join(notes), tag))
+            lock = lockstep_warnings(self._read_arrays(), wear)
 
             def show():
                 self.htree.delete(*self.htree.get_children())
                 for r in rows:
-                    self.htree.insert("", "end", values=r[:6], tags=(r[6],))
+                    self.htree.insert("", "end", values=r[:7], tags=(r[7],))
+                self.wear_msg.configure(text="\n".join("⚠ " + m for m in lock))
             self.ui(show)
-            self.log(f"Health check finished for {len(rows)} drive(s).", "good")
+            self.log(f"Health check finished for {len(rows)} drive(s)."
+                     + (f" {len(lock)} mirror pair(s) wearing in step." if lock else ""), "warn" if lock else "good")
         self.work("checking drive health", job)
+
+    # ---- TRIM
+    def _trim_state(self):
+        """Returns (schedule, lines). schedule: Weekly/Daily/Off/Unavailable."""
+        S, lines = self.sys, []
+        if DEMO:
+            sched = getattr(self, "_demo_trim", "Weekly (recommended)")
+            first = ("warn", "Automatic TRIM is off. SSDs slowly lose speed and wear less evenly without it") \
+                if sched == "Off" else ("ok", f"Automatic TRIM is on: every {'day' if sched == 'Daily' else 'week'} "
+                                              "(fstrim.timer)")
+            return sched, [first,
+                ("ok", "nvme0n1, nvme1n1: TRIM supported"),
+                ("warn", "sde (USB): this enclosure doesn't pass TRIM through, so the SSD can't be told which blocks are free"),
+                ("warn", "md127 (RAID 5): Linux blocks TRIM on RAID 5/6 by default for safety. Wear is still fine"),
+                ("ok", "Other arrays pass TRIM through to their SSDs")]
+        rc, en = S.run(["systemctl", "is-enabled", "fstrim.timer"], quiet=True)
+        en = en.strip()
+        daily = "OnCalendar=daily" in S.read_text(TRIM_OVERRIDE)
+        if rc != 0 and en not in ("disabled", "masked"):
+            sched = "Unavailable"
+            lines.append(("bad", "fstrim.timer isn't installed (util-linux). TRIM now still works if fstrim exists"))
+        elif en == "enabled":
+            sched = "Daily" if daily else "Weekly (recommended)"
+            lines.append(("ok", f"Automatic TRIM is on: every {'day' if daily else 'week'} (fstrim.timer)"))
+        else:
+            sched = "Off"
+            lines.append(("warn", "Automatic TRIM is off. SSDs slowly lose speed and wear less evenly without it"))
+        rc, out = S.run(["lsblk", "-J", "-b", "-o", "NAME,TYPE,TRAN,ROTA,DISC-MAX"], quiet=True)
+        try:
+            devs = json.loads(out)["blockdevices"]
+        except (ValueError, KeyError):
+            devs = []
+        ok_ssd = []
+        for d in devs:
+            if d.get("type") != "disk" or d.get("rota") or re.match(r"(loop|zram|ram|mmcblk)", d["name"]):
+                continue
+            if int(d.get("disc-max") or 0) > 0:
+                ok_ssd.append(d["name"])
+            elif d.get("tran") == "usb":
+                lines.append(("warn", f"{d['name']} (USB): this enclosure doesn't pass TRIM through, so the SSD "
+                                      "can't be told which blocks are free. A UASP enclosure that supports TRIM fixes it"))
+            else:
+                lines.append(("warn", f"{d['name']}: doesn't report TRIM support"))
+        if ok_ssd:
+            lines.append(("ok", f"{', '.join(ok_ssd)}: TRIM supported"))
+        for a in self._read_arrays():
+            mx = S.read_text(f"/sys/block/{a['name']}/queue/discard_max_bytes", "0").strip()
+            if a["level"] in ("raid5", "raid6") and mx in ("0", ""):
+                lines.append(("warn", f"{a['name']} ({a['level'].upper().replace('RAID', 'RAID ')}): Linux blocks TRIM "
+                                      "on RAID 5/6 by default for safety. Wear is still fine"))
+            elif mx not in ("0", ""):
+                lines.append(("ok", f"{a['name']} ({a['level']}): passes TRIM through to its drives"))
+        return sched, lines
+
+    def refresh_trim(self):
+        def job():
+            sched, lines = self._trim_state()
+
+            def show():
+                if sched != "Unavailable":
+                    self.trim_sched.set(sched)
+                icon = {"ok": "✓", "warn": "!", "bad": "✗"}
+                self.trim_info.configure(text="\n".join(f"{icon[s]}  {t}" for s, t in lines),
+                                         fg=WARN if any(s != "ok" for s, _ in lines) else MUTED)
+            self.ui(show)
+        threading.Thread(target=job, daemon=True).start()
+
+    def apply_trim(self):
+        choice = self.trim_sched.get()
+        S = self.sys
+
+        def job():
+            if DEMO:
+                self._demo_trim = choice
+            if choice == "Daily":
+                S.run(["mkdir", "-p", os.path.dirname(TRIM_OVERRIDE)], root=True, quiet=True)
+                S.write_root_file(TRIM_OVERRIDE, TRIM_DAILY)
+            else:
+                S.run(["rm", "-f", TRIM_OVERRIDE], root=True, quiet=True)
+            S.run(["systemctl", "daemon-reload"], root=True, quiet=True)
+            if choice == "Off":
+                rc, _ = S.run(["systemctl", "disable", "--now", "fstrim.timer"], root=True)
+            else:
+                rc, _ = S.run(["systemctl", "enable", "--now", "fstrim.timer"], root=True)
+                S.run(["systemctl", "restart", "fstrim.timer"], root=True, quiet=True)
+            self.log(f"✓ Automatic TRIM: {choice.split(' ')[0].lower()}." if rc == 0 else
+                     "Couldn't change the TRIM schedule.", "good" if rc == 0 else "bad")
+            self.ui(self.refresh_trim)
+        self.work("setting TRIM schedule", job)
+
+    def trim_now(self):
+        def job():
+            self.log("TRIM on every mounted SSD that supports it…", "info")
+            if DEMO:
+                self.log("  /mnt/vault: 212.4 GiB (228051234816 bytes) trimmed (demo)", "muted")
+                self.log("  /: 18.1 GiB (19434569728 bytes) trimmed (demo)", "muted")
+                rc = 0
+            else:
+                rc = self.sys.run_stream(["fstrim", "-av"], root=True,
+                                         on_text=lambda t: self.log("  " + t, "muted"))
+            self.log("✓ TRIM finished." if rc == 0 else "TRIM finished with warnings (see above).",
+                     "good" if rc == 0 else "warn")
+        self.work("running TRIM", job)
 
     # ============================================================ refresh
     def refresh_all(self):
