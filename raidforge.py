@@ -1290,4 +1290,17 @@ if __name__ == "__main__":
     if "--version" in sys.argv:
         print(f"{APP} {VERSION}")
         sys.exit(0)
+    # Opened from a menu/desktop icon with no password-free sudo: ask for the password ONCE by
+    # restarting as admin, instead of a password box for every disk command. Cancel = carry on as-is.
+    if (not DEMO and os.geteuid() != 0 and "--elevated" not in sys.argv and shutil.which("pkexec")
+            and subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode != 0):
+        env = [f"{k}={os.environ[k]}" for k in ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR")
+               if os.environ.get(k)]
+        if os.environ.get("DISPLAY") and not os.environ.get("XAUTHORITY"):
+            env.append(f"XAUTHORITY={os.path.expanduser('~/.Xauthority')}")
+        rc = subprocess.call(["pkexec", "env", *env, f"SUDO_USER={USER}", sys.executable,
+                              os.path.abspath(__file__), "--elevated", *sys.argv[1:]])
+        if rc == 0:                       # ran as admin and was closed normally
+            sys.exit(0)
+        # cancelled (126/127) or the admin copy couldn't open a window: run normally instead
     App().mainloop()
