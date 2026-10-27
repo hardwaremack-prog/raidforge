@@ -42,7 +42,10 @@ Then open **Menu → System Tools → RAID Forge**. Use **RAID Forge (Demo)** fi
 | Pi 500 | No PCIe connector is exposed, so use USB 3 drives, a USB multi-bay dock or USB HAT. Use powered enclosures. |
 | Pi 400 | Same as the Pi 500: no PCIe, so use the two blue USB 3 ports with powered drives or a multi-bay dock. Slower (USB 3 is shared), but RAID 1 / 5 work well. |
 | Pi 500+ | Has one internal M.2 slot — add USB drives to reach RAID levels that need more. |
+| Pi 5 + SunFounder Pironman 5-MAX | 2 NVMe slots behind a Gen 2 switch: RAID 1, PCIe Gen 2, ~410–450 MB/s. |
 
 Minimum drives: RAID 0 / 1 → 2, RAID 5 → 3, RAID 6 / 10 → 4 (RAID 10 even numbers only).
+
+**📈 Speeds, Gen 2 vs Gen 3, "does RAID 1 double reads?", and recommended setups: see [SPEED-GUIDE.md](SPEED-GUIDE.md).**
 
 RAID is not a backup — keep a copy of anything important somewhere else.

@@ -108,6 +108,8 @@ HATS = [
     ("Auto-detect", "Shows whatever drives the Pi can see."),
     ("Radxa Penta SATA HAT", "Up to 5 SATA drives over PCIe. Needs PCIe enabled and its own 12 V power."),
     ("Dual NVMe HAT (Pimoroni Duo, Geekworm X1004 …)", "2 NVMe drives behind a PCIe switch. Use PCIe Gen 2."),
+    ("SunFounder Pironman 5-MAX (2 × NVMe)", "Both slots share one Gen 2 switch (~450 MB/s total). Use PCIe Gen 2 and "
+                                             "RAID 1; Gen 3 and RAID 0 won't make it faster. Needs the 27 W supply."),
     ("Quad NVMe HAT (PCIe switch)", "Up to 4 NVMe drives behind a PCIe switch. Use PCIe Gen 2."),
     ("USB 3 drives / USB HAT / dock", "Works on Pi 5, Pi 500 and Pi 400 (blue USB 3 ports). Use a powered hub or dock for 2.5\"/3.5\" drives."),
 ]
