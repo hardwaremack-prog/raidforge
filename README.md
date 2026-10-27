@@ -48,6 +48,16 @@ with warnings at 60% / 80% and a flag for mirror pairs wearing in step. Its **TR
 
 ![Drive Health: SSD wear and TRIM](docs/drive-health.png)
 
+**Finding a drive (Identify / Blink)**: with a row of identical USB drives, RAID Forge can blink one drive's
+activity light. It reads from just that drive in a slow on/off rhythm, read-only and safe on a live array, and shows
+which **USB port** (USB 3 or 2, hub port, dock slot), **SATA port** or **NVMe slot** it's on, plus its **serial number**.
+- **Blink** button on every drive (Set up RAID), **Identify drives…** (My Arrays), **Blink selected drive** (Drive Health)
+- **Find the failed drive**: blinks all the healthy drives together, so the dead one is the light that stays dark
+- **Replace a drive…** offers to do that first, so you pull the right one
+- If an array is busy (resync), it uses longer 2-second bursts that stand out from normal flicker
+
+![Find the failed drive](docs/identify.png)
+
 ## Hardware notes
 | Setup | Notes |
 |---|---|

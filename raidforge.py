@@ -23,7 +23,7 @@ import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 
 APP = "RAID Forge"
-VERSION = "1.2"
+VERSION = "1.3"
 DEMO = "--demo" in sys.argv or os.environ.get("RAIDFORGE_DEMO") == "1"
 USER = os.environ.get("SUDO_USER") or getpass.getuser()
 
@@ -104,6 +104,59 @@ def lockstep_warnings(arrays, wear):
                 out.append(f"{a['name']}: {d1} ({w1}%) and {d2} ({w2}%) are wearing in step. Consider replacing "
                            f"one early (My Arrays > Replace a drive) so they don't wear out together.")
     return out
+
+
+# Runs as admin for one "on" burst: keeps reading 1 MB at random spots (bypassing caches) until the time is up,
+# so the drive's activity light stays lit for the whole burst. Read-only.
+BLINK_READER = r'''
+import os, sys, time, random, mmap
+dev, secs, size = sys.argv[1], float(sys.argv[2]), int(sys.argv[3] or 0)
+B = 1 << 20
+try:
+    fd = os.open(dev, os.O_RDONLY | getattr(os, "O_DIRECT", 0))
+except OSError:
+    fd = os.open(dev, os.O_RDONLY)
+if size <= 0:
+    size = os.lseek(fd, 0, os.SEEK_END)
+blocks = max(size // B - 1, 1)
+buf = mmap.mmap(-1, B)
+end = time.monotonic() + secs
+while time.monotonic() < end:
+    try:
+        os.preadv(fd, [buf], random.randrange(blocks) * B)
+    except OSError:
+        time.sleep(0.01)
+os.close(fd)
+'''
+
+
+def describe_location(syspath, read_text):
+    """Turn /sys/block/<disk>'s real path into words: 'USB 3 (blue port) · bus 4, port 1 · hub port 2'."""
+    parts = []
+    usb = [s for s in syspath.split("/") if re.fullmatch(r"\d+-[\d.]+", s)]
+    if usb:
+        seg = usb[-1]
+        bus, port = seg.split("-", 1)
+        speed = read_text(f"/sys/bus/usb/devices/{seg}/speed", "").strip()
+        kind = ("USB 3 (blue port)" if speed.isdigit() and int(speed) >= 5000 else
+                "USB 2 (black port)" if speed in ("480", "12", "1.5") else "USB")
+        top, *hub = port.split(".")
+        parts += [kind, f"bus {bus}, port {top}"]
+        if hub:
+            parts.append(f"hub port {hub[-1]}")
+        lun = re.search(r"/\d+:\d+:\d+:(\d+)/block/", syspath)
+        if lun and int(lun.group(1)) > 0:
+            parts.append(f"dock slot {int(lun.group(1)) + 1}")
+        return " · ".join(parts)
+    m = re.search(r"/ata(\d+)/", syspath)
+    if m:
+        return f"SATA port {m.group(1)}"
+    m = re.search(r"/([0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.\d)/nvme/", syspath)
+    if m:
+        return f"NVMe, PCIe address {m.group(1)[5:]}"
+    if "mmc" in syspath:
+        return "SD card slot"
+    return ""
 
 
 TRIM_OVERRIDE = "/etc/systemd/system/fstrim.timer.d/raidforge.conf"
@@ -424,6 +477,45 @@ class System:
             return "/mnt/vault"
         rc, out = self.run(["findmnt", "-no", "TARGET", "-S", dev], quiet=True)
         return out.strip().splitlines()[0] if out.strip() else ""
+
+    # ---- finding a physical drive
+    def location(self, name):
+        """Where a disk is plugged in, in plain words (USB port + speed, SATA port, PCIe slot)."""
+        if DEMO:
+            return {"sda": "USB 3 (blue port) · bus 2, port 1 · dock slot 1",
+                    "sdb": "USB 3 (blue port) · bus 2, port 1 · dock slot 2",
+                    "sdc": "USB 3 (blue port) · bus 4, port 1 · dock slot 1",
+                    "sdd": "USB 3 (blue port) · bus 4, port 1 · dock slot 2",
+                    "sde": "USB 2 (black port) · bus 1, port 2"}.get(name, "")
+        return describe_location(os.path.realpath(f"/sys/block/{name}"), self.read_text)
+
+    def can_blink(self):
+        return DEMO or os.geteuid() == 0 or self.priv_prefix()[:1] == ["sudo"]
+
+    def blink(self, disks, stop, on_s=1.0, off_s=1.0, on_phase=None):
+        """Read from each disk in an on/off rhythm so its activity light blinks. Read-only, safe on live arrays.
+        disks: [{"path":..., "size":...}]. stop: threading.Event. on_phase(True/False) is called each change."""
+        while not stop.is_set():
+            if on_phase:
+                on_phase(True)
+            procs = []
+            if not DEMO:
+                for d in disks:
+                    cmd = self.priv_prefix() + [sys.executable, "-c", BLINK_READER, d["path"], str(on_s),
+                                                str(int(d.get("size") or 0))]
+                    try:
+                        procs.append(subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+                    except OSError:
+                        pass
+            stop.wait(on_s)
+            for p in procs:
+                try:
+                    p.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+            if on_phase:
+                on_phase(False)
+            stop.wait(off_s)
 
 
 # ================================================================= GUI
@@ -778,6 +870,9 @@ class App(tk.Tk):
             if d.get("serial"):
                 sub += f"  ·  {d['serial']}"
             tk.Label(info, text=sub, bg=CARD, fg=MUTED, font=("DejaVu Sans", 8)).pack(anchor="w")
+            if d["tran"] != "mmc":
+                ttk.Button(row, text="Blink", width=6,
+                           command=lambda n=d["name"]: self.identify([n])).pack(side="right", padx=(0, 8))
             if busy:
                 tk.Label(row, text=d["busy"], bg=CARD, fg=WARN, font=("DejaVu Sans", 8)).pack(side="right", padx=8)
             self.disk_vars[d["path"]], self.spare_vars[d["path"]] = v, sv
@@ -1090,7 +1185,8 @@ class App(tk.Tk):
         acts.pack(fill="x", pady=8)
         for t, fn in (("Details", self.show_detail), ("Scrub (check data)", self.scrub),
                       ("Speed test", self.speed_test), ("Replace a drive…", self.replace_drive),
-                      ("Add hot spare…", self.add_spare), ("Stop", self.stop_array)):
+                      ("Add hot spare…", self.add_spare), ("Identify drives…", self.identify_member),
+                      ("Stop", self.stop_array)):
             ttk.Button(acts, text=t, command=fn).pack(side="left", padx=(0, 6))
         ttk.Button(acts, text="Delete array…", style="Danger.TButton", command=self.delete_array).pack(side="right")
 
@@ -1255,6 +1351,14 @@ class App(tk.Tk):
                                                "(Pick the failed one — it'll be marked failed and removed.)", outgoing)
         if not old:
             return
+        if messagebox.askyesno(APP, f"Want help finding {old} first?\n\nRAID Forge can blink the other drives in the "
+                                    "array. The one whose light stays dark is the one to pull."):
+            others = [disk_of(d) for d, s in a["devices"] if f"/dev/{d}" != old and s != "failed"]
+            w = self.identify(others, f"Find {old}", note=(
+                f"The other drives blink together in time with the dot. {old} is the one that stays dark. "
+                "Match its port and serial too. Press Stop when you've found it."), target=[os.path.basename(old)])
+            if isinstance(w, tk.Toplevel):
+                self.wait_window(w)
         new = self._pick_from("Replace drive", "Which new drive goes in?\n(It will be erased.)", self._free_disks())
         if not new:
             return
@@ -1341,6 +1445,121 @@ class App(tk.Tk):
                 S.run(["update-initramfs", "-u"], root=True, timeout=900)
             self.log(f"✓ {a['alias']} deleted; its drives are free again.", "good")
         self.work("deleting array", job)
+
+    # ============================================================ IDENTIFY (blink a drive's light)
+    def _disk_dicts(self, names):
+        info = {d["name"]: d for d in self.sys.disks()}
+        out = []
+        for n in names:
+            d = dict(info.get(n) or {"name": n, "path": f"/dev/{n}", "size": 0, "model": "", "serial": ""})
+            d["where"] = self.sys.location(n)
+            out.append(d)
+        return out
+
+    def identify(self, names, title="Identify drive", note=None, target=None):
+        """Blink the activity light of the given disks (by name) in a slow on/off rhythm."""
+        if not self.sys.can_blink():
+            return messagebox.showinfo(APP, "Blinking a drive needs admin rights. Restart RAID Forge and enter "
+                                            "your password when it asks.")
+        disks = self._disk_dicts(names)
+        busy = [a for a in self.arrays if a.get("op")]
+        on_s = off_s = 2.0 if busy else 1.0
+        stop = threading.Event()
+        left = {"s": 30}
+        win = tk.Toplevel(self, bg=PANEL)
+        win.title(title)
+        win.transient(self)
+        tk.Label(win, text=title, bg=PANEL, fg=FG, font=("DejaVu Sans", 14, "bold")).pack(anchor="w", padx=18, pady=(16, 2))
+        tk.Label(win, bg=PANEL, fg=MUTED, justify="left", wraplength=640, text=note or (
+            f"Look for the activity light that goes on for {on_s:.0f} s, then off for {off_s:.0f} s, in time with "
+            "the dot below. It only reads from the drive, so it's safe even while the array is in use.")
+                 ).pack(anchor="w", padx=18)
+        if busy:
+            tk.Label(win, bg=PANEL, fg=WARN, justify="left", wraplength=640, text=(
+                f"{busy[0]['alias']} is busy ({busy[0]['op']}), so every light is flickering. RAID Forge is using "
+                "longer 2-second bursts: look for the light that goes fully dark for 2 seconds at a time.")
+                     ).pack(anchor="w", padx=18, pady=(6, 0))
+        mid = tk.Frame(win, bg=PANEL)
+        mid.pack(fill="x", padx=18, pady=12)
+        dot = tk.Canvas(mid, width=64, height=64, bg=PANEL, highlightthickness=0)
+        dot.pack(side="left", padx=(0, 16))
+        lamp = dot.create_oval(8, 8, 56, 56, fill=LINE, outline="")
+        lst = tk.Frame(mid, bg=PANEL)
+        lst.pack(side="left", fill="x", expand=True)
+        for d in disks:
+            r = tk.Frame(lst, bg=CARD)
+            r.pack(fill="x", pady=2)
+            tk.Label(r, text=f"{d['path']}   {human(d['size']) if d['size'] else ''}", bg=CARD, fg=FG,
+                     font=("DejaVu Sans", 10, "bold")).pack(anchor="w", padx=10, pady=(4, 0))
+            sub = "  ·  ".join(x for x in (d.get("model"), f"serial {d['serial']}" if d.get("serial") else "",
+                                            d.get("where")) if x)
+            tk.Label(r, text=sub or "no details reported", bg=CARD, fg=MUTED, font=("DejaVu Sans", 9),
+                     wraplength=520, justify="left").pack(anchor="w", padx=10, pady=(0, 4))
+        for d in self._disk_dicts(target or []):
+            r = tk.Frame(win, bg=PANEL, highlightthickness=2, highlightbackground=WARN)
+            r.pack(fill="x", padx=18, pady=(0, 10))
+            tk.Label(r, text=f"Looking for {d['path']} (its light stays dark)", bg=PANEL, fg=WARN,
+                     font=("DejaVu Sans", 10, "bold")).pack(anchor="w", padx=10, pady=(4, 0))
+            sub = "  ·  ".join(x for x in (d.get("model"), f"serial {d['serial']}" if d.get("serial") else "",
+                                            d.get("where")) if x)
+            tk.Label(r, text=sub or "It isn't answering, so check the drives not listed above",
+                     bg=PANEL, fg=MUTED, font=("DejaVu Sans", 9)).pack(anchor="w", padx=10, pady=(0, 4))
+        status = tk.Label(win, text="", bg=PANEL, fg=MUTED)
+        status.pack(anchor="w", padx=18)
+        bf = tk.Frame(win, bg=PANEL)
+        bf.pack(fill="x", padx=18, pady=14)
+        more = ttk.Button(bf, text="Keep blinking (+30 s)", command=lambda: left.update(s=left["s"] + 30))
+        more.pack(side="left")
+
+        def close():
+            stop.set()
+            win.destroy()
+        ttk.Button(bf, text="Stop", style="Accent.TButton", command=close).pack(side="right")
+        win.protocol("WM_DELETE_WINDOW", close)
+
+        def phase(on):
+            self.ui(lambda: win.winfo_exists() and dot.itemconfigure(lamp, fill=ACCENT if on else LINE))
+
+        def tick():
+            if not win.winfo_exists() or stop.is_set():
+                return
+            left["s"] -= 1
+            if left["s"] <= 0:
+                return close()
+            status.configure(text=f"Blinking… stops in {left['s']} s")
+            win.after(1000, tick)
+        names_txt = ", ".join(d["path"] for d in disks)
+        self.log(f"Blinking {names_txt} (reads only).", "info")
+        threading.Thread(target=self.sys.blink, args=(disks, stop, on_s, off_s, phase), daemon=True).start()
+        tick()
+        return win
+
+    def identify_member(self):
+        """My Arrays: blink one member, or all the healthy ones to find a dead/missing drive."""
+        a = self.current_array()
+        if not a:
+            return
+        members = [(disk_of(d), s) for d, s in a["devices"]]
+        healthy = [n for n, s in members if s != "failed"]
+        failed = [n for n, s in members if s == "failed"]
+        opts = [(f"one:{n}", f"/dev/{n}  ({s})") for n, s in members]
+        opts.append(("healthy", "Blink all the healthy drives: the one that stays dark is the failed or missing one"))
+        pick = self._pick_from("Identify drives", f"Which drive in {a['alias']} do you want to find?", opts)
+        if not pick:
+            return
+        if pick == "healthy":
+            self.identify(healthy, "Find the failed drive", note=(
+                "Every healthy drive in the array blinks together in time with the dot. The failed or missing "
+                "drive is the one whose light stays dark (or doesn't match). Check its port and serial below "
+                "against the others."), target=failed)
+        else:
+            self.identify([pick[4:]])
+
+    def identify_health_row(self):
+        sel = self.htree.selection()
+        if not sel:
+            return messagebox.showinfo(APP, "Click a drive in the list first (run Check all drives if it's empty).")
+        self.identify([os.path.basename(self.htree.item(sel[0], "values")[0])])
 
     # ============================================================ MOVE SYSTEM TO RAID
     def _migration_checks(self, a):
@@ -1722,6 +1941,7 @@ class App(tk.Tk):
         top = ttk.Frame(root, style="Bg.TFrame")
         top.pack(fill="x", pady=(10, 6))
         ttk.Button(top, text="Check all drives (SMART)", command=self.check_health).pack(side="left")
+        ttk.Button(top, text="Blink selected drive", command=self.identify_health_row).pack(side="left", padx=(6, 0))
         ttk.Label(top, text="Health, temperature and SSD wear. Some USB enclosures don't pass this through.",
                   foreground=MUTED).pack(side="left", padx=10)
 
@@ -1746,7 +1966,7 @@ class App(tk.Tk):
         self.wear_msg = tk.Label(root, text="", bg=BG, fg=WARN, justify="left", anchor="w", wraplength=1100)
         self.wear_msg.pack(side="bottom", fill="x", pady=(6, 0))
         cols = ("drive", "model", "health", "wear", "temp", "hours", "notes")
-        self.htree = ttk.Treeview(root, columns=cols, show="headings", selectmode="none")
+        self.htree = ttk.Treeview(root, columns=cols, show="headings", selectmode="browse")
         for c, t, w in zip(cols, ("Drive", "Model", "Health", "SSD wear", "Temp", "Power-on hours", "Notes"),
                            (110, 220, 90, 150, 70, 110, 330)):
             self.htree.heading(c, text=t)

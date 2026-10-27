@@ -84,6 +84,20 @@ Drive Health tab has the controls:
 - After **Move system to RAID**, the SD card is only written when a kernel update lands in the boot partition.
   SD cards have the weakest wear levelling of all, so this is the biggest win for reliability.
 
+## Telling identical drives apart
+
+Most USB enclosures and docks wire their activity light to the enclosure's own chip, so software can't switch it on
+or off directly. (`ledctl`-style "locate" lights only exist on server backplanes.) RAID Forge makes the light blink
+**by reading from that one drive** in a rhythm: about 1 second of steady reads, then 1 second idle. The reads skip the
+cache and only read, so it's safe on a running array.
+- On a busy array (resync, big copies) every light flickers, so RAID Forge switches to 2-second bursts. Look for the
+  light that goes **fully dark** for 2 seconds at a time.
+- A failed drive often doesn't answer at all, so it can't blink. **Find the failed drive** blinks the healthy ones
+  instead, and the dead one is the light that stays dark.
+- Every drive also shows its **port** (USB 3 blue / USB 2 black, bus and port, hub port, dock slot; SATA port; NVMe
+  PCIe address) and **serial number**. Write the serial on a sticker on each enclosure when you set the array up.
+- Some enclosures only have a power light. Then the port and serial are how you find it.
+
 ## SunFounder Pironman 5-MAX (dual NVMe case)
 
 - 2 × M.2 M-key slots (2230–2280) behind an **ASM1182e Gen 2 PCIe switch**, plus a micro SD slot
