@@ -23,7 +23,7 @@ import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 
 APP = "RAID Forge"
-VERSION = "1.0"
+VERSION = "1.1"
 DEMO = "--demo" in sys.argv or os.environ.get("RAIDFORGE_DEMO") == "1"
 USER = os.environ.get("SUDO_USER") or getpass.getuser()
 
@@ -31,6 +31,49 @@ CONFIG_TXT = next((p for p in ("/boot/firmware/config.txt", "/boot/config.txt")
                    if os.path.exists(p)), "/boot/firmware/config.txt")
 MDADM_CONF = next((p for p in ("/etc/mdadm/mdadm.conf", "/etc/mdadm.conf")
                    if os.path.exists(p)), "/etc/mdadm/mdadm.conf")
+BOOT_DIR = os.path.dirname(CONFIG_TXT)                 # the SD card's boot partition
+CMDLINE = os.path.join(BOOT_DIR, "cmdline.txt")
+CMDLINE_SD = CMDLINE + ".raidforge-sd"                 # original, kept for "boot from SD again"
+NEWROOT = "/mnt/raidforge-newroot"
+RSYNC_EXCLUDES = ["/dev/*", "/proc/*", "/sys/*", "/run/*", "/tmp/*", "/mnt/*", "/media/*",
+                  "/lost+found", "/var/swap", "/swapfile", "/var/cache/apt/archives/*.deb",
+                  NEWROOT]
+# RAID levels + the ways drives connect (USB, NVMe, SATA HAT). Built-in ones are skipped harmlessly.
+INITRAMFS_MODULES = ["md_mod", "raid0", "raid1", "raid10", "raid456",
+                     "usb_storage", "uas", "sd_mod", "nvme", "ahci"]
+
+
+# ---------------------------------------------------------------- migration file edits (pure, testable)
+def edit_fstab(text, fs_uuid, fstype, old_uuids=()):
+    """New root's fstab: '/' comes from the array; drop the array's old data-mount line(s)."""
+    drop = {f"UUID={u}" for u in (fs_uuid, *old_uuids) if u}
+    out, had_root = [], False
+    for line in text.splitlines():
+        f = line.split()
+        if f and not f[0].startswith("#") and len(f) >= 2:
+            if f[1] == "/":
+                out.append(f"UUID={fs_uuid}  /  {fstype}  defaults,noatime  0  1  # RAID Forge: system on RAID")
+                had_root = True
+                continue
+            if f[0] in drop:
+                continue                       # was mounted as a data folder; now it's the system
+        out.append(line)
+    if not had_root:
+        out.insert(0, f"UUID={fs_uuid}  /  {fstype}  defaults,noatime  0  1  # RAID Forge: system on RAID")
+    return "\n".join(out) + "\n"
+
+
+def edit_cmdline(text, fs_uuid, fstype):
+    """cmdline.txt is one line: point root= at the array and make sure the kernel waits for it."""
+    parts = [p for p in text.split() if not p.startswith(("root=", "rootfstype=", "rootwait"))]
+    return " ".join([f"root=UUID={fs_uuid}", f"rootfstype={fstype}", "rootwait"] + parts) + "\n"
+
+
+def ensure_initramfs(config_text):
+    """The kernel needs an initramfs (with mdadm) to find a RAID root. Pi OS turns it on with auto_initramfs=1."""
+    if re.search(r"^\s*(auto_initramfs=1|initramfs\s)", config_text, re.M):
+        return config_text
+    return config_text.rstrip("\n") + "\n[all]\n# Added by RAID Forge (system on RAID)\nauto_initramfs=1\n"
 
 # ---------------------------------------------------------------- colours
 BG, PANEL, CARD, LINE = "#0f1419", "#161d26", "#1d2632", "#2a3646"
@@ -187,6 +230,41 @@ class System:
     def has(self, tool):
         return DEMO or shutil.which(tool) is not None or os.path.exists(f"/usr/sbin/{tool}") \
             or os.path.exists(f"/sbin/{tool}")
+
+    def run_stream(self, args, root=False, on_text=None):
+        """Run a long command, feeding each output line/progress update to on_text. Returns rc."""
+        self.log("$ " + " ".join(args), "cmd")
+        cmd = (self.priv_prefix() + args) if root else args
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        except FileNotFoundError:
+            self.log(f"  command not found: {args[0]}", "bad")
+            return 127
+        buf = b""
+        while True:
+            ch = p.stdout.read(256)
+            if not ch:
+                break
+            buf += ch
+            parts = re.split(rb"[\r\n]", buf)
+            buf = parts.pop()
+            for part in parts:
+                if part.strip() and on_text:
+                    on_text(part.decode("utf-8", "replace"))
+        if buf.strip() and on_text:
+            on_text(buf.decode("utf-8", "replace"))
+        return p.wait()
+
+    def used_bytes(self, path="/"):
+        st = os.statvfs(path)
+        return (st.f_blocks - st.f_bfree) * st.f_frsize
+
+    def read_text(self, path, default=""):
+        try:
+            with open(path) as f:
+                return f.read()
+        except OSError:
+            return default
 
     def pcie_config(self):
         """Returns (enabled, gen) from config.txt."""
@@ -728,8 +806,11 @@ class App(tk.Tk):
         b, src, tools, pc = facts["board"], facts["root"], facts["tools"], facts["pcie"]
         self.chk_labels["board"].configure(text=b, fg=FG)
         on_sd = "mmcblk" in src
-        self.chk_labels["boot"].configure(
-            text=f"{'SD card ✓' if on_sd else 'Not the SD card'}\n{src}", fg=GOOD if on_sd else WARN)
+        if "/md" in src:
+            txt, col = f"SD card (boot) ✓\nsystem on RAID {src}", GOOD
+        else:
+            txt, col = f"{'SD card ✓' if on_sd else 'Not the SD card'}\n{src}", GOOD if on_sd else WARN
+        self.chk_labels["boot"].configure(text=txt, fg=col)
         self.chk_labels["tools"].configure(text="mdadm ready ✓" if tools else "mdadm not installed",
                                            fg=GOOD if tools else BAD)
         self.btn_tools.state(["disabled"] if tools else ["!disabled"])
@@ -968,6 +1049,15 @@ class App(tk.Tk):
             ttk.Button(acts, text=t, command=fn).pack(side="left", padx=(0, 6))
         ttk.Button(acts, text="Delete array…", style="Danger.TButton", command=self.delete_array).pack(side="right")
 
+        mig = ttk.Frame(root, style="Panel.TFrame", padding=10)
+        mig.pack(fill="x", pady=(0, 8))
+        ttk.Label(mig, text="Run the whole system from RAID", style="H.Panel.TLabel").pack(side="left")
+        ttk.Label(mig, text="  copies everything off the SD card; the SD card only starts the Pi",
+                  style="Muted.Panel.TLabel").pack(side="left")
+        ttk.Button(mig, text="Boot from SD again…", command=self.undo_migration).pack(side="right")
+        ttk.Button(mig, text="Move system to RAID…", style="Accent.TButton",
+                   command=self.migrate_wizard).pack(side="right", padx=6)
+
         self.detail = tk.Text(root, bg=PANEL, fg=FG, bd=0, highlightthickness=0,
                               font=("DejaVu Sans Mono", 9), padx=10, pady=8)
         self.detail.pack(fill="both", expand=True)
@@ -1149,8 +1239,17 @@ class App(tk.Tk):
                 self.sys.run(["mdadm", "--manage", f"/dev/{a['name']}", "--add-spare", new], root=True)
             self.work("adding spare", job)
 
+    def _is_system(self, a):
+        if a and a.get("mount") == "/":
+            messagebox.showerror(APP, f"{a['alias']} holds the running system, so it can't be stopped or "
+                                      "deleted from here.\nUse 'Boot from SD again…' and reboot first.")
+            return True
+        return False
+
     def stop_array(self):
         a = self.current_array()
+        if self._is_system(a):
+            return
         if a and messagebox.askyesno(APP, f"Unmount and stop {a['alias']}?\nData is kept — "
                                           "use 'Find & start existing arrays' to bring it back."):
             def job():
@@ -1161,7 +1260,7 @@ class App(tk.Tk):
 
     def delete_array(self):
         a = self.current_array()
-        if not a:
+        if not a or self._is_system(a):
             return
         short = a["alias"].split("/")[-1]
         typed = simpledialog.askstring(APP, f"This destroys {a['alias']} and ALL its data,\n"
@@ -1197,6 +1296,353 @@ class App(tk.Tk):
                 S.run(["update-initramfs", "-u"], root=True, timeout=900)
             self.log(f"✓ {a['alias']} deleted; its drives are free again.", "good")
         self.work("deleting array", job)
+
+    # ============================================================ MOVE SYSTEM TO RAID
+    def _migration_checks(self, a):
+        """Returns (items, info). items: [(state, text)] with state ok/warn/bad."""
+        S, items = self.sys, []
+        md = f"/dev/{a['name']}"
+        info = dict(md=md, fstype="ext4", fs_uuid="", nonempty=0, need_tools=[], need_initramfs=False,
+                    unformatted=False)
+        add = lambda st, t: items.append((st, t))
+        if DEMO:
+            used, size = 9_800_000_000, a["size"] or 4_000_000_000_000
+            add("ok", "The system is on the SD card (/dev/mmcblk0p2)")
+            add("ok", "Boot files (/dev/mmcblk0p1) stay on the SD card")
+            add("ok", f"{a['level'].upper()} array is healthy")
+            add("ok", f"Needs about {human(used * 1.15)}, the array has {human(size)}")
+            add("warn", "The array has 3 files/folders on it, so it must be erased first")
+            add("ok", "Startup files (initramfs) are on and will include RAID support")
+            info.update(fs_uuid="demo-fs-uuid", nonempty=3, used=used)
+            return items, info
+
+        src = S.root_source()
+        if "/md" in src:
+            add("bad", f"The system already runs from RAID ({src}). Use 'Boot from SD again…' to go back.")
+        elif "mmcblk" not in src:
+            add("bad", f"The system isn't on the SD card ({src}). This tool moves an SD-card system.")
+        else:
+            add("ok", f"The system is on the SD card ({src})")
+        rc, bsrc = S.run(["findmnt", "-no", "SOURCE", BOOT_DIR], quiet=True)
+        bsrc = bsrc.strip()
+        if not bsrc or not os.path.exists(CMDLINE):
+            add("bad", f"Can't find the boot partition ({BOOT_DIR}/cmdline.txt)")
+        else:
+            add("ok", f"Boot files ({bsrc}) stay on the SD card")
+
+        if a["state"] != "active" or "_" in a.get("health", "") or any(s == "failed" for _, s in a["devices"]):
+            add("bad", "The array is degraded or not running. Fix it first (Replace a drive…)")
+        elif a["op"] and a["pct"] is not None:
+            add("warn", f"Still syncing ({a['pct']:.0f}%). That's OK, it keeps syncing after the move, but the copy will be slower")
+        else:
+            add("ok", f"{a['level'].upper()} array is healthy")
+        if a["level"] == "raid0":
+            add("warn", "RAID 0: if either drive dies the whole system is lost. RAID 1 is the safe choice")
+
+        rc, out = S.run(["blkid", "-o", "export", md], root=True, quiet=True)
+        kv = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
+        if kv.get("TYPE") in ("ext4", "xfs"):
+            info["fstype"], info["fs_uuid"] = kv["TYPE"], kv.get("UUID", "")
+        else:
+            info["unformatted"] = True
+            add("warn", "The array has no ext4/XFS filesystem yet. It will be formatted as ext4")
+
+        rc, out = S.run(["blockdev", "--getsize64", md], root=True, quiet=True)
+        size = int(out.strip() or 0) if out.strip().isdigit() else (a["size"] or 0)
+        used = S.used_bytes("/")
+        info["used"] = used
+        need = used * 1.15 + 1_000_000_000
+        if size and size < need:
+            add("bad", f"Not enough room: the system needs about {human(need)}, the array has {human(size)}")
+        else:
+            add("ok", f"Needs about {human(need)}, the array has {human(size)}")
+
+        if not info["unformatted"]:
+            mnt, tmp = a.get("mount"), False
+            if not mnt:
+                S.run(["mkdir", "-p", NEWROOT], root=True, quiet=True)
+                rc, _ = S.run(["mount", "-o", "ro", md, NEWROOT], root=True, quiet=True)
+                mnt, tmp = (NEWROOT, True) if rc == 0 else (None, False)
+            if mnt:
+                rc, out = S.run(["ls", "-A", mnt], root=True, quiet=True)
+                info["nonempty"] = len([x for x in out.split() if x != "lost+found"])
+            if tmp:
+                S.run(["umount", NEWROOT], root=True, quiet=True)
+            if info["nonempty"]:
+                add("warn", f"The array has {info['nonempty']} files/folders on it ({a.get('mount') or 'not mounted'}), "
+                            "so it must be erased first")
+            else:
+                add("ok", "The array is empty")
+
+        for tool, pkg in (("rsync", "rsync"), ("update-initramfs", "initramfs-tools")):
+            if not S.has(tool):
+                info["need_tools"].append(pkg)
+        if not S.has("mdadm"):
+            add("bad", "mdadm isn't installed")
+        if info["need_tools"]:
+            add("warn", f"Will install first: {', '.join(info['need_tools'])}")
+        if not re.search(r"^\s*(auto_initramfs=1|initramfs\s)", S.read_text(CONFIG_TXT), re.M):
+            info["need_initramfs"] = True
+            add("warn", "Startup files (initramfs) are off. They'll be turned on so the Pi can find the RAID")
+        else:
+            add("ok", "Startup files (initramfs) are on and will include RAID support")
+        return items, info
+
+    def migrate_wizard(self):
+        a = self.current_array()
+        if not a:
+            return
+        if self.busy:
+            return messagebox.showinfo(APP, "Another job is still running. Wait for it to finish.")
+        win = tk.Toplevel(self, bg=PANEL)
+        win.title("Move system to RAID")
+        win.transient(self)
+        win.geometry("760x640")
+        tk.Label(win, text=f"Move the whole system onto {a['alias']}", bg=PANEL, fg=FG,
+                 font=("DejaVu Sans", 14, "bold")).pack(anchor="w", padx=18, pady=(16, 4))
+        tk.Label(win, bg=PANEL, fg=MUTED, justify="left", wraplength=720, text=(
+            "Copies everything on the SD card (programs, settings, your files) onto the array, then tells the "
+            "Pi to load the system from the array. The SD card keeps only the small boot partition, so the Pi "
+            "still starts from it, and it keeps its old copy of the system as a fallback. "
+            "'Boot from SD again…' switches back at any time.")).pack(anchor="w", padx=18)
+
+        box = tk.Frame(win, bg=CARD)
+        box.pack(fill="x", padx=18, pady=12)
+        tk.Label(box, text="Checking…", bg=CARD, fg=MUTED).pack(anchor="w", padx=12, pady=10)
+
+        erase = tk.BooleanVar(value=False)
+        er = ttk.Checkbutton(win, text="Erase everything on the array first", variable=erase)
+        prog = ttk.Progressbar(win, mode="determinate", maximum=100)
+        stat = tk.Label(win, text="", bg=PANEL, fg=MUTED, anchor="w", justify="left", wraplength=720)
+        bf = tk.Frame(win, bg=PANEL)
+        bf.pack(side="bottom", fill="x", padx=18, pady=14)
+        go = ttk.Button(bf, text="Move system to RAID", style="Accent.TButton")
+        go.pack(side="right")
+        go.state(["disabled"])
+        close = ttk.Button(bf, text="Close", command=win.destroy)
+        close.pack(side="right", padx=8)
+        state = {}
+
+        def show(items, info):
+            if not win.winfo_exists():
+                return
+            for w in box.winfo_children():
+                w.destroy()
+            icon = {"ok": ("✓", GOOD), "warn": ("!", WARN), "bad": ("✗", BAD)}
+            for st, text in items:
+                r = tk.Frame(box, bg=CARD)
+                r.pack(fill="x", padx=12, pady=3)
+                tk.Label(r, text=icon[st][0], bg=CARD, fg=icon[st][1], width=2,
+                         font=("DejaVu Sans", 11, "bold")).pack(side="left")
+                tk.Label(r, text=text, bg=CARD, fg=FG, justify="left", wraplength=660, anchor="w").pack(side="left")
+            state.update(items=items, info=info)
+            if info["nonempty"] or info["unformatted"]:
+                erase.set(bool(info["unformatted"]))
+                er.pack(anchor="w", padx=18)
+            prog.pack(fill="x", padx=18, pady=(10, 2))
+            stat.pack(fill="x", padx=18)
+            stat.configure(text="Close other programs before starting. Copying takes a few minutes per GB "
+                                "on USB drives, less on NVMe.", fg=MUTED)
+            refresh_go()
+
+        def refresh_go(*_):
+            items, info = state.get("items", []), state.get("info", {})
+            ok = items and not any(st == "bad" for st, _ in items) and \
+                (not info.get("nonempty") or erase.get())
+            go.state(["!disabled"] if ok else ["disabled"])
+        erase.trace_add("write", refresh_go)
+
+        def checks():
+            items, info = self._migration_checks(a)
+            self.ui(lambda: show(items, info))
+        threading.Thread(target=checks, daemon=True).start()
+
+        def setp(pct, text, col=MUTED):
+            def f():
+                if win.winfo_exists():
+                    if pct is not None:
+                        prog["value"] = pct
+                    stat.configure(text=text, fg=col)
+            self.ui(f)
+
+        def start():
+            info = state["info"]
+            msg = (f"Copy the whole system onto {a['alias']} and start from it after a reboot?\n\n"
+                   + ("EVERYTHING on the array will be erased first.\n\n" if erase.get() else "")
+                   + "The SD card is not erased: it keeps the boot files and a fallback copy of the system.")
+            if not messagebox.askyesno(APP, msg, parent=win):
+                return
+            go.state(["disabled"])
+            er.state(["disabled"])
+
+            def job():
+                ok = self._do_migrate(a, info, erase.get(), setp)
+                if ok:
+                    self.ui(lambda: self._offer_reboot_msg(
+                        "The system is copied and the Pi is set to run from RAID.\n\nReboot now?", parent=win))
+            self.work("moving system to RAID", job)
+        go.configure(command=start)
+
+    def _offer_reboot_msg(self, text, parent=None):
+        if messagebox.askyesno(APP, text, parent=parent or self):
+            self.sys.run(["systemctl", "reboot"], root=True)
+
+    def _do_migrate(self, a, info, erase, setp):
+        S, md = self.sys, info["md"]
+
+        def fail(text):
+            self.log(text, "bad")
+            setp(None, "✗ " + text + "  Nothing on the SD card was changed; it still starts normally.", BAD)
+            S.run(["umount", NEWROOT], root=True, quiet=True)
+            return False
+
+        self.log(f"── Moving the system to {a['alias']} ──", "info")
+        if info["need_tools"]:
+            setp(2, "Installing " + ", ".join(info["need_tools"]) + "…")
+            rc, _ = S.run(["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y",
+                           "--no-install-recommends"] + info["need_tools"], root=True, timeout=1200)
+            if rc != 0:
+                return fail("Couldn't install the tools it needs.")
+
+        setp(5, "Getting the array ready…")
+        if a.get("mount"):
+            if S.run(["umount", a["mount"]], root=True)[0] != 0 and not DEMO:
+                return fail(f"Couldn't unmount {a['mount']} (is a program using it?).")
+        S.run(["mkdir", "-p", NEWROOT], root=True, quiet=True)
+        old_uuid = info["fs_uuid"]                 # its data-mount line must go too, even after a reformat
+        if erase or info["unformatted"]:
+            fstype = info["fstype"] if info["fstype"] in ("ext4", "xfs") else "ext4"
+            label = a["alias"].split("/")[-1][:12]
+            mk = ["mkfs.ext4", "-F", "-L", label, md] if fstype == "ext4" else ["mkfs.xfs", "-f", "-L", label, md]
+            setp(7, "Erasing and formatting the array…")
+            if S.run(mk, root=True, timeout=3600)[0] != 0:
+                return fail("Formatting the array failed.")
+            S.run(["udevadm", "settle"], root=True, quiet=True)
+            rc, out = S.run(["blkid", "-s", "UUID", "-o", "value", md], root=True, quiet=True)
+            info["fstype"], info["fs_uuid"] = fstype, out.strip() or info["fs_uuid"]
+        if not info["fs_uuid"]:
+            return fail("Couldn't read the array's filesystem ID.")
+        if S.run(["mount", md, NEWROOT], root=True)[0] != 0:
+            return fail("Couldn't mount the array.")
+
+        # make sure the array is listed in mdadm.conf (it goes into the startup files)
+        rc, out = S.run(["mdadm", "--detail", "--brief", md], root=True, quiet=True)
+        line = next((l for l in out.splitlines() if l.startswith("ARRAY")), "")
+        um = re.search(r"UUID=(\S+)", line)
+        if um and um.group(1) not in S.read_text(MDADM_CONF):
+            S.run(["mkdir", "-p", os.path.dirname(MDADM_CONF)], root=True, quiet=True)
+            S.write_root_file(MDADM_CONF, line + "\n", append=True)
+
+        setp(10, "Copying the system… (this is the long part)")
+        if DEMO:
+            import time
+            for pct in range(0, 101, 5):
+                setp(10 + pct * 0.75, f"Copying the system… {pct}%   (demo)")
+                time.sleep(0.12)
+            rc = 0
+        else:
+            args = ["rsync", "-aAXHx", "--numeric-ids", "--info=progress2", "--no-inc-recursive"]
+            for ex in RSYNC_EXCLUDES:
+                args += ["--exclude", ex]
+            args += ["/", NEWROOT + "/"]
+            last = [0]
+
+            def on_text(t):
+                m = re.search(r"(\d+)%.*?([\d.]+[kMG]B/s)?\s+(\d+:\d+:\d+)", t)
+                if m and int(m.group(1)) != last[0]:
+                    last[0] = int(m.group(1))
+                    setp(10 + last[0] * 0.75, f"Copying the system… {last[0]}%"
+                                              f"{'   ' + m.group(2) if m.group(2) else ''}   {m.group(3)} left")
+            rc = S.run_stream(args, root=True, on_text=on_text)
+        if rc not in (0, 24):                       # 24 = some files vanished while copying (normal on a live system)
+            return fail(f"Copying stopped with an error (rsync code {rc}).")
+
+        setp(86, "Setting up the copy to start on its own…")
+        for d in ("dev", "proc", "sys", "run", "tmp", "mnt", "media", os.path.relpath(BOOT_DIR, "/")):
+            S.run(["mkdir", "-p", os.path.join(NEWROOT, d)], root=True, quiet=True)
+        S.run(["chmod", "1777", os.path.join(NEWROOT, "tmp")], root=True, quiet=True)
+        fstab_new = edit_fstab(S.read_text(os.path.join(NEWROOT, "etc/fstab"),
+                                           S.read_text("/etc/fstab")) if not DEMO else
+                               "PARTUUID=abcd-01  /boot/firmware  vfat  defaults  0  2\n"
+                               "PARTUUID=abcd-02  /  ext4  defaults,noatime  0  1\n",
+                               info["fs_uuid"], info["fstype"], old_uuids=(old_uuid,))
+        if S.write_root_file(os.path.join(NEWROOT, "etc/fstab"), fstab_new) != 0:
+            return fail("Couldn't write the new system's fstab.")
+        S.run(["cp", MDADM_CONF, os.path.join(NEWROOT, MDADM_CONF.lstrip("/"))], root=True, quiet=True)
+        if old_uuid and old_uuid != info["fs_uuid"] and not DEMO:   # reformatted: the SD copy's old line is dead
+            live = S.read_text("/etc/fstab")
+            kept = "".join(l for l in live.splitlines(True) if f"UUID={old_uuid}" not in l.split("#")[0])
+            if kept != live:
+                S.write_root_file("/etc/fstab", kept)
+
+        if info["need_initramfs"]:
+            S.run(["cp", CONFIG_TXT, CONFIG_TXT + ".raidforge.bak"], root=True, quiet=True)
+            S.write_root_file(CONFIG_TXT, ensure_initramfs(S.read_text(CONFIG_TXT)))
+
+        # drivers the startup files must carry to reach the drives and assemble the array
+        mods_path = "/etc/initramfs-tools/modules"
+        have = S.read_text(mods_path).split()
+        want = []
+        for m in INITRAMFS_MODULES:
+            if m in have:
+                continue
+            rc, out = S.run(["modinfo", "-F", "filename", m], quiet=True)
+            if DEMO or (rc == 0 and ".ko" in out):     # built-in or unknown on this kernel: nothing to add
+                want.append(m)
+        if want:
+            S.write_root_file(mods_path, "# Added by RAID Forge (system on RAID)\n" + "\n".join(want) + "\n",
+                              append=True)
+
+        setp(90, "Rebuilding the startup files with RAID support (a minute or two)…")
+        if S.run(["update-initramfs", "-u", "-k", "all"], root=True, timeout=1800)[0] != 0 and not DEMO:
+            return fail("Rebuilding the startup files (initramfs) failed.")
+        if not DEMO:
+            if not any(f.startswith("initramfs") for f in os.listdir(BOOT_DIR)):
+                return fail(f"No initramfs file in {BOOT_DIR}, so the Pi couldn't find the RAID. Stopped.")
+            kv = os.uname().release
+            img = f"/boot/initrd.img-{kv}"
+            if shutil.which("lsinitramfs") and os.path.exists(img):
+                rc, out = S.run(["lsinitramfs", img], root=True, quiet=True, timeout=300)
+                if "mdadm" not in out:
+                    return fail("The startup files don't contain mdadm, so the Pi couldn't find the RAID. Stopped.")
+        # copy the fresh startup files' source config into the new root too
+        S.run(["rsync", "-aAX", "/etc/initramfs-tools/", os.path.join(NEWROOT, "etc/initramfs-tools/")],
+              root=True, quiet=True)
+
+        setp(96, "Pointing the Pi at the RAID…")
+        if DEMO or not os.path.exists(CMDLINE_SD):
+            S.run(["cp", CMDLINE, CMDLINE_SD], root=True)
+        old = S.read_text(CMDLINE, "console=serial0,115200 console=tty1 root=PARTUUID=abcd-02 rootfstype=ext4 fsck.repair=yes rootwait")
+        if S.write_root_file(CMDLINE, edit_cmdline(old, info["fs_uuid"], info["fstype"])) != 0:
+            return fail("Couldn't change cmdline.txt.")
+        note = (f"RAID Forge moved this Pi's system to {a['alias']} (filesystem UUID {info['fs_uuid']}).\n"
+                f"cmdline.txt now starts the system from the RAID.\n\n"
+                f"TO GO BACK TO THE SD CARD: open RAID Forge > My Arrays > 'Boot from SD again…'\n"
+                f"or, if the Pi won't start, put this SD card in another computer and copy\n"
+                f"cmdline.txt.raidforge-sd over cmdline.txt on the boot partition.\n")
+        S.write_root_file(os.path.join(BOOT_DIR, "RAID-FORGE-README.txt"), note)
+        S.run(["sync"], root=True, quiet=True)
+        S.run(["umount", NEWROOT], root=True, quiet=True)
+        setp(100, "✓ Done. Reboot and the Pi runs from the RAID. The SD card still starts it.", GOOD)
+        self.log(f"✓ System copied to {a['alias']}. Reboot to start from it.", "good")
+        return True
+
+    def undo_migration(self):
+        if not DEMO and not os.path.exists(CMDLINE_SD):
+            return messagebox.showinfo(APP, "The system isn't set to run from RAID, so there's nothing to undo.")
+        if not messagebox.askyesno(APP, "Go back to running the system from the SD card?\n\n"
+                                        "After the reboot the Pi uses the copy on the SD card. Anything changed "
+                                        "since the move (new files, installs) is only on the RAID; it stays there "
+                                        "and you can mount the array to get it."):
+            return
+
+        def job():
+            if self.sys.run(["cp", CMDLINE_SD, CMDLINE], root=True)[0] == 0:
+                self.sys.run(["rm", "-f", CMDLINE_SD, os.path.join(BOOT_DIR, "RAID-FORGE-README.txt")],
+                             root=True, quiet=True)
+                self.log("✓ cmdline.txt restored. The system will start from the SD card after a reboot.", "good")
+                self.ui(lambda: self._offer_reboot_msg("Set to start from the SD card. Reboot now?"))
+        self.work("switching back to the SD card", job)
 
     # ============================================================ TAB 3: health
     def _health_tab(self):

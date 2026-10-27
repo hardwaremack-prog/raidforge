@@ -22,6 +22,16 @@ Then open **Menu → System Tools → RAID Forge**. Use **RAID Forge (Demo)** fi
 
 **② My Arrays** — live status every 3 s with sync/rebuild progress, details, scrub, speed test, replace a failed drive, add a hot spare, stop, re-assemble, delete (also cleans up fstab/mdadm.conf)
 
+**Move system to RAID** (on My Arrays) — runs the whole system from the array; the SD card only starts the Pi
+- Checks first: system is on the SD card, array is healthy and big enough, startup files (initramfs) can find RAID
+- Copies everything from the SD card onto the array with live progress (rsync), erasing the array first if needed
+- Points the new copy's `fstab` at the array, adds the RAID/USB/NVMe/SATA drivers to the initramfs and rebuilds it
+- Backs up `cmdline.txt` as `cmdline.txt.raidforge-sd`, then sets `root=` to the array and asks to reboot
+- The SD card keeps its boot partition and its old copy of the system as a fallback
+- **Boot from SD again…** puts the original `cmdline.txt` back. If the Pi ever won't start, put the SD card in another
+  computer and copy `cmdline.txt.raidforge-sd` over `cmdline.txt` (see `RAID-FORGE-README.txt` on the card)
+- Use RAID 1 (or 5/6/10) for this: on RAID 0 one dead drive takes the whole system with it
+
 **③ Drive Health** — SMART pass/fail, temperature, power-on hours, reallocated/pending sectors, NVMe wear
 
 ## Hardware notes
