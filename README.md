@@ -58,6 +58,30 @@ which **USB port** (USB 3 or 2, hub port, dock slot), **SATA port** or **NVMe sl
 
 ![Find the failed drive](docs/identify.png)
 
+**RAID Watch** (the alarm): a small watchdog that keeps an eye on every array and sounds the alarm when one needs service.
+Turn it on in **My Arrays → RAID Watch → Turn on**. It runs in the background from boot (even with no screen), and its little
+window opens when you log in, then hides itself while everything is healthy.
+
+| | |
+|:---:|:---:|
+| ![RAID Watch alarming](docs/raid-watch-alarm.png) | ![RAID Watch silenced](docs/raid-watch-silenced.png) |
+| **Alarm**: window flashes red, alarm sound, desktop pop-up | **Silenced**: quiet, but still shows what's wrong |
+
+| Level | What triggers it | What happens |
+|---|---|---|
+| 🔴 Critical | drive failed, array degraded, array stopped, array didn't start, SMART says FAILING, 98%+ full | window flashes + alarm sound every 5 s, pop-up, Pi's green light flashes fast, phone push |
+| 🟠 Warning | rebuild running on a degraded array, SSD wear 80%+, new bad sectors, drive over 60 °C, 90%+ full, data-check mismatches, hot spare used up | pop-up, amber window, phone push |
+| 🔵 Info | rebuild / sync / check in progress (with % and time left) | shown in the window |
+| 🟢 OK | everything healthy | "back to normal" pop-up and phone push after a problem |
+
+- **Silence alarm** stops the sound and light. If it's still broken 4 hours later (or 1/12/24, your choice), it alarms again.
+- **Test alarm** (My Arrays) raises a pretend alarm for a minute, so you can check the sound, the light and your phone.
+- **Phone alerts (optional)**: install the free **ntfy** app, press **Settings… → Make one** for a private topic name and
+  subscribe to it in the app. You get one push when something breaks and one when it's fixed.
+- Checks arrays every 15 s and drive SMART every 6 h. Status is in `/run/raidwatch/status.json`, and the history is in
+  `journalctl -u raidwatch`. Over SSH, `sudo python3 /opt/raidforge/raidwatch.py --once` prints the current state.
+- Try the window with a pretend failed drive: `python3 raidwatch.py --demo`
+
 ## Hardware notes
 | Setup | Notes |
 |---|---|

@@ -23,7 +23,7 @@ import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 
 APP = "RAID Forge"
-VERSION = "1.3"
+VERSION = "1.4"
 DEMO = "--demo" in sys.argv or os.environ.get("RAIDFORGE_DEMO") == "1"
 USER = os.environ.get("SUDO_USER") or getpass.getuser()
 
@@ -160,6 +160,12 @@ def describe_location(syspath, read_text):
 
 
 TRIM_OVERRIDE = "/etc/systemd/system/fstrim.timer.d/raidforge.conf"
+WATCH_UNIT = "/etc/systemd/system/raidwatch.service"
+WATCH_AUTOSTART = "/etc/xdg/autostart/raidwatch.desktop"
+WATCH_MENU = "/usr/share/applications/raidwatch.desktop"
+WATCH_CONF = "/etc/raidwatch.json"
+WATCH_STATUS = "/run/raidwatch/status.json"
+HERE = os.path.dirname(os.path.abspath(__file__))
 TRIM_DAILY = ("# Added by RAID Forge: TRIM every day instead of every week\n"
               "[Timer]\nOnCalendar=\nOnCalendar=daily\nAccuracySec=1h\nRandomizedDelaySec=30min\nPersistent=true\n")
 ZRAM_CONF = "# Added by RAID Forge (low-wear): swap lives in compressed RAM, not on the drives\nALGO=zstd\nPERCENT=50\nPRIORITY=100\n"
@@ -1199,6 +1205,17 @@ class App(tk.Tk):
         ttk.Button(mig, text="Move system to RAID…", style="Accent.TButton",
                    command=self.migrate_wizard).pack(side="right", padx=6)
 
+        wp = ttk.Frame(root, style="Panel.TFrame", padding=10)
+        wp.pack(fill="x", pady=(0, 8))
+        ttk.Label(wp, text="RAID Watch", style="H.Panel.TLabel").pack(side="left")
+        self.watch_lbl = tk.Label(wp, text="  checking…", bg=PANEL, fg=MUTED)
+        self.watch_lbl.pack(side="left")
+        ttk.Button(wp, text="Test alarm", command=self.watch_test).pack(side="right")
+        ttk.Button(wp, text="Settings…", command=self.watch_settings).pack(side="right", padx=6)
+        self.watch_btn = ttk.Button(wp, text="Turn on", style="Accent.TButton", command=self.watch_toggle)
+        self.watch_btn.pack(side="right")
+        self.after(800, self.watch_refresh)
+
         self.detail = tk.Text(root, bg=PANEL, fg=FG, bd=0, highlightthickness=0,
                               font=("DejaVu Sans Mono", 9), padx=10, pady=8)
         self.detail.pack(fill="both", expand=True)
@@ -1445,6 +1462,191 @@ class App(tk.Tk):
                 S.run(["update-initramfs", "-u"], root=True, timeout=900)
             self.log(f"✓ {a['alias']} deleted; its drives are free again.", "good")
         self.work("deleting array", job)
+
+    # ============================================================ RAID WATCH (monitor + alarm)
+    def _watch_state(self):
+        if DEMO:
+            return getattr(self, "_demo_watch", False), {"level": "ok", "alerts": [], "infos": []}
+        rc, out = self.sys.run(["systemctl", "is-active", "raidwatch"], quiet=True)
+        on = out.strip() == "active"
+        try:
+            with open(WATCH_STATUS) as f:
+                st = json.load(f)
+        except (OSError, ValueError):
+            st = None
+        return on, st
+
+    def watch_refresh(self):
+        def job():
+            on, st = self._watch_state()
+
+            def show():
+                if on and st:
+                    lv = st.get("level", "ok")
+                    n = len(st.get("alerts", []))
+                    txt = {"ok": "  ● on: all arrays healthy", "info": "  ● on: healthy, " + (st.get("infos") or [""])[0],
+                           "warn": f"  ● on: {n} warning{'s' if n != 1 else ''}",
+                           "crit": "  ● on: RAID NEEDS SERVICE"}.get(lv, "  ● on")
+                    col = {"ok": GOOD, "info": INFO, "warn": WARN, "crit": BAD}.get(lv, GOOD)
+                elif on:
+                    txt, col = "  ● on: starting…", GOOD
+                else:
+                    txt, col = "  ○ off: nothing is watching your arrays. Turn it on for alarms", WARN
+                self.watch_lbl.configure(text=txt, fg=col)
+                self.watch_btn.configure(text="Turn off" if on else "Turn on",
+                                         style="TButton" if on else "Accent.TButton")
+            self.ui(show)
+        threading.Thread(target=job, daemon=True).start()
+        self.after(10000, self.watch_refresh)
+
+    def watch_toggle(self):
+        on, _ = self._watch_state()
+        S = self.sys
+        script = os.path.join(HERE, "raidwatch.py")
+        if not on and not os.path.exists(script):
+            return messagebox.showerror(APP, f"raidwatch.py isn't next to RAID Forge ({HERE}). Reinstall RAID Forge.")
+
+        def job():
+            if DEMO:
+                self._demo_watch = not on
+            if on:
+                S.run(["systemctl", "disable", "--now", "raidwatch"], root=True)
+                S.run(["rm", "-f", WATCH_AUTOSTART], root=True, quiet=True)
+                self.log("RAID Watch turned off. Nothing is watching the arrays now.", "warn")
+            else:
+                need = [p for p, tool in (("smartmontools", "smartctl"), ("libnotify-bin", "notify-send"))
+                        if not S.has(tool)]
+                if need and not DEMO:
+                    S.run(["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y",
+                           "--no-install-recommends"] + need, root=True, timeout=900)
+                py = sys.executable or "/usr/bin/python3"
+                S.write_root_file(WATCH_UNIT, f"""[Unit]
+Description=RAID Watch: alarms when a RAID array needs service
+After=local-fs.target mdmonitor.service
+
+[Service]
+ExecStart={py} {script} --daemon
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+""")
+                desk = f"""[Desktop Entry]
+Type=Application
+Name=RAID Watch
+Comment=Shows your RAID's health and sounds the alarm if it needs service
+Exec={py} {script}
+Icon={os.path.join(HERE, "raidwatch.png")}
+Terminal=false
+Categories=System;Monitor;
+"""
+                S.run(["mkdir", "-p", os.path.dirname(WATCH_AUTOSTART)], root=True, quiet=True)
+                S.write_root_file(WATCH_AUTOSTART, desk)
+                S.write_root_file(WATCH_MENU, desk)
+                S.run(["systemctl", "daemon-reload"], root=True, quiet=True)
+                rc, _ = S.run(["systemctl", "enable", "--now", "raidwatch"], root=True)
+                self.log("✓ RAID Watch is on. It starts with the Pi; its window opens when you log in."
+                         if rc == 0 else "Couldn't start RAID Watch.", "good" if rc == 0 else "bad")
+                if rc == 0:
+                    self.ui(self.watch_open)
+            self.ui(self.watch_refresh)
+        self.work("RAID Watch", job)
+
+    def watch_open(self):
+        """Open the RAID Watch window as you (not as admin)."""
+        cmd = [sys.executable, os.path.join(HERE, "raidwatch.py")] + (["--demo"] if DEMO else [])
+        if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
+            env = [f"{k}={os.environ[k]}" for k in ("DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "XAUTHORITY",
+                                                    "DBUS_SESSION_BUS_ADDRESS") if os.environ.get(k)]
+            cmd = ["runuser", "-u", os.environ["SUDO_USER"], "--", "env", *env] + cmd
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+
+    def watch_test(self):
+        on, _ = self._watch_state()
+        if not on:
+            return messagebox.showinfo(APP, "Turn RAID Watch on first.")
+
+        def job():
+            self.sys.run(["mkdir", "-p", "/run/raidwatch"], root=True, quiet=True)
+            self.sys.run(["touch", "/run/raidwatch/test-alarm"], root=True)
+            self.log("Test alarm sent: within ~15 s the RAID Watch window alarms, the green light flashes fast, "
+                     "and your phone buzzes if phone alerts are set. It clears itself after a minute.", "good")
+        self.work("test alarm", job)
+
+    def watch_settings(self):
+        try:
+            with open(WATCH_CONF) as f:
+                cur = json.load(f)
+        except (OSError, ValueError):
+            cur = {}
+        win = tk.Toplevel(self, bg=PANEL)
+        win.title("RAID Watch settings")
+        win.transient(self)
+        win.grab_set()
+        tk.Label(win, text="RAID Watch settings", bg=PANEL, fg=FG, font=("DejaVu Sans", 13, "bold")
+                 ).pack(anchor="w", padx=18, pady=(14, 4))
+        body = tk.Frame(win, bg=PANEL)
+        body.pack(fill="x", padx=18)
+        sound = tk.BooleanVar(value=cur.get("sound", True))
+        led = tk.BooleanVar(value=cur.get("led_alarm", True))
+        remind = tk.StringVar(value=str(cur.get("remind_hours", 4)))
+        smart = tk.StringVar(value=str(cur.get("smart_hours", 6)))
+        topic = tk.StringVar(value=cur.get("ntfy_topic", ""))
+        server = tk.StringVar(value=cur.get("ntfy_server", "https://ntfy.sh"))
+        ttk.Checkbutton(body, text="Alarm sound for critical problems (plays through the Pi's speakers/HDMI)",
+                        variable=sound).pack(anchor="w", pady=2)
+        ttk.Checkbutton(body, text="Flash the Pi's green light fast while something is critical",
+                        variable=led).pack(anchor="w", pady=2)
+        r = tk.Frame(body, bg=PANEL)
+        r.pack(anchor="w", pady=4)
+        tk.Label(r, text="After Silence, alarm again if still broken after", bg=PANEL, fg=FG).pack(side="left")
+        ttk.Combobox(r, textvariable=remind, values=["1", "4", "12", "24"], width=4, state="readonly").pack(side="left", padx=4)
+        tk.Label(r, text="hours", bg=PANEL, fg=FG).pack(side="left")
+        r = tk.Frame(body, bg=PANEL)
+        r.pack(anchor="w", pady=4)
+        tk.Label(r, text="Check drive health (SMART) every", bg=PANEL, fg=FG).pack(side="left")
+        ttk.Combobox(r, textvariable=smart, values=["1", "6", "12", "24"], width=4, state="readonly").pack(side="left", padx=4)
+        tk.Label(r, text="hours", bg=PANEL, fg=FG).pack(side="left")
+        tk.Label(body, text="Phone alerts (optional, needs internet)", bg=PANEL, fg=FG,
+                 font=("DejaVu Sans", 10, "bold")).pack(anchor="w", pady=(12, 0))
+        tk.Label(body, bg=PANEL, fg=MUTED, justify="left", wraplength=560, text=(
+            "Install the free ntfy app on your phone, tap +, and subscribe to the topic below. RAID Watch then "
+            "sends a push when a RAID needs service and when it's fixed. Anyone who knows the topic name can "
+            "read it, so keep the random one.")).pack(anchor="w")
+        r = tk.Frame(body, bg=PANEL)
+        r.pack(anchor="w", pady=4, fill="x")
+        tk.Label(r, text="Topic", bg=PANEL, fg=FG, width=7, anchor="w").pack(side="left")
+        ttk.Entry(r, textvariable=topic, width=34).pack(side="left")
+
+        def gen():
+            import secrets
+            topic.set(f"raid-{os.uname().nodename}-{secrets.token_hex(5)}")
+        ttk.Button(r, text="Make one", command=gen).pack(side="left", padx=6)
+        r = tk.Frame(body, bg=PANEL)
+        r.pack(anchor="w", pady=2, fill="x")
+        tk.Label(r, text="Server", bg=PANEL, fg=FG, width=7, anchor="w").pack(side="left")
+        ttk.Entry(r, textvariable=server, width=34).pack(side="left")
+        bf = tk.Frame(win, bg=PANEL)
+        bf.pack(fill="x", padx=18, pady=14)
+
+        def save():
+            conf = dict(cur, sound=sound.get(), led_alarm=led.get(), remind_hours=int(remind.get()),
+                        smart_hours=int(smart.get()), ntfy_topic=topic.get().strip(),
+                        ntfy_server=server.get().strip() or "https://ntfy.sh")
+            win.destroy()
+
+            def job():
+                if self.sys.write_root_file(WATCH_CONF, json.dumps(conf, indent=1) + "\n") == 0:
+                    self.log("✓ RAID Watch settings saved (used from its next check)."
+                             + ("  Phone alerts go to ntfy topic " + conf["ntfy_topic"] + "." if conf["ntfy_topic"] else ""),
+                             "good")
+            self.work("saving RAID Watch settings", job)
+        ttk.Button(bf, text="Save", style="Accent.TButton", command=save).pack(side="right")
+        ttk.Button(bf, text="Cancel", command=win.destroy).pack(side="right", padx=8)
 
     # ============================================================ IDENTIFY (blink a drive's light)
     def _disk_dicts(self, names):
