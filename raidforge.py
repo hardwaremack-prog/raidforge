@@ -23,7 +23,7 @@ import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 
 APP = "RAID Forge"
-VERSION = "1.4"
+VERSION = "1.5"
 DEMO = "--demo" in sys.argv or os.environ.get("RAIDFORGE_DEMO") == "1"
 USER = os.environ.get("SUDO_USER") or getpass.getuser()
 
@@ -1578,11 +1578,13 @@ Categories=System;Monitor;
         self.work("test alarm", job)
 
     def watch_settings(self):
-        try:
-            with open(WATCH_CONF) as f:
-                cur = json.load(f)
-        except (OSError, ValueError):
-            cur = {}
+        cur = {}
+        if not DEMO:                                  # the settings file is admin-only (it holds the web password hash)
+            rc, out = self.sys.run(["cat", WATCH_CONF], root=True, quiet=True)
+            try:
+                cur = json.loads(out) if rc == 0 else {}
+            except ValueError:
+                cur = {}
         win = tk.Toplevel(self, bg=PANEL)
         win.title("RAID Watch settings")
         win.transient(self)
@@ -1630,20 +1632,84 @@ Categories=System;Monitor;
         r.pack(anchor="w", pady=2, fill="x")
         tk.Label(r, text="Server", bg=PANEL, fg=FG, width=7, anchor="w").pack(side="left")
         ttk.Entry(r, textvariable=server, width=34).pack(side="left")
+
+        # over-temperature alarm
+        talarm = tk.BooleanVar(value=cur.get("temp_alarm", False))
+        tdrive = tk.StringVar(value=str(cur.get("temp_alarm_drive", 65)))
+        tcpu = tk.StringVar(value=str(cur.get("temp_alarm_cpu", 80)))
+        tk.Label(body, text="Over-temperature alarm (optional)", bg=PANEL, fg=FG,
+                 font=("DejaVu Sans", 10, "bold")).pack(anchor="w", pady=(12, 0))
+        ttk.Checkbutton(body, text="Sound the alarm if a drive or the Pi gets too hot (checks every 2 minutes)",
+                        variable=talarm).pack(anchor="w", pady=2)
+        r = tk.Frame(body, bg=PANEL)
+        r.pack(anchor="w", pady=2)
+        tk.Label(r, text="Drives at", bg=PANEL, fg=FG).pack(side="left")
+        ttk.Combobox(r, textvariable=tdrive, values=["55", "60", "65", "70", "75"], width=4,
+                     state="readonly").pack(side="left", padx=4)
+        tk.Label(r, text="°C     Pi processor at", bg=PANEL, fg=FG).pack(side="left")
+        ttk.Combobox(r, textvariable=tcpu, values=["70", "75", "80", "85"], width=4,
+                     state="readonly").pack(side="left", padx=4)
+        tk.Label(r, text="°C   (warns 5 °C before)", bg=PANEL, fg=MUTED).pack(side="left")
+
+        # web page
+        webon = tk.BooleanVar(value=cur.get("web", False))
+        port = tk.StringVar(value=str(cur.get("web_port", 8484)))
+        pw1, pw2 = tk.StringVar(), tk.StringVar()
+        has_pw = bool(cur.get("web_password"))
+        tk.Label(body, text="Web page (optional)", bg=PANEL, fg=FG,
+                 font=("DejaVu Sans", 10, "bold")).pack(anchor="w", pady=(12, 0))
+        ttk.Checkbutton(body, text="Show RAID Watch on a web page for phones/PCs on your home network",
+                        variable=webon).pack(anchor="w", pady=2)
+        r = tk.Frame(body, bg=PANEL)
+        r.pack(anchor="w", pady=2)
+        tk.Label(r, text="Port", bg=PANEL, fg=FG, width=9, anchor="w").pack(side="left")
+        ttk.Entry(r, textvariable=port, width=7).pack(side="left")
+        r = tk.Frame(body, bg=PANEL)
+        r.pack(anchor="w", pady=2)
+        tk.Label(r, text="Password", bg=PANEL, fg=FG, width=9, anchor="w").pack(side="left")
+        ttk.Entry(r, textvariable=pw1, width=20, show="•").pack(side="left")
+        tk.Label(r, text=" again", bg=PANEL, fg=FG).pack(side="left")
+        ttk.Entry(r, textvariable=pw2, width=20, show="•").pack(side="left", padx=4)
+        tk.Label(body, bg=PANEL, fg=MUTED, justify="left", wraplength=560, text=(
+            ("A password is set. Leave these blank to keep it. " if has_pw else "Pick a password of 8+ characters. ")
+            + "Use the page on your home network only; don't open this port to the internet.")).pack(anchor="w")
         bf = tk.Frame(win, bg=PANEL)
         bf.pack(fill="x", padx=18, pady=14)
 
         def save():
             conf = dict(cur, sound=sound.get(), led_alarm=led.get(), remind_hours=int(remind.get()),
                         smart_hours=int(smart.get()), ntfy_topic=topic.get().strip(),
-                        ntfy_server=server.get().strip() or "https://ntfy.sh")
+                        ntfy_server=server.get().strip() or "https://ntfy.sh",
+                        temp_alarm=talarm.get(), temp_alarm_drive=int(tdrive.get()), temp_alarm_cpu=int(tcpu.get()),
+                        web=webon.get())
+            if not port.get().strip().isdigit() or not 1024 <= int(port.get()) <= 65535:
+                return messagebox.showerror(APP, "The web page port must be a number from 1024 to 65535.", parent=win)
+            conf["web_port"] = int(port.get())
+            if pw1.get() or pw2.get():
+                if pw1.get() != pw2.get():
+                    return messagebox.showerror(APP, "The two passwords don't match.", parent=win)
+                if len(pw1.get()) < 8:
+                    return messagebox.showerror(APP, "Use a password of at least 8 characters.", parent=win)
+                sys.path.insert(0, HERE)
+                import raidwatch
+                conf["web_password"] = raidwatch.make_hash(pw1.get())
+            elif webon.get() and not has_pw:
+                return messagebox.showerror(APP, "Set a password for the web page first.", parent=win)
             win.destroy()
 
             def job():
                 if self.sys.write_root_file(WATCH_CONF, json.dumps(conf, indent=1) + "\n") == 0:
-                    self.log("✓ RAID Watch settings saved (used from its next check)."
-                             + ("  Phone alerts go to ntfy topic " + conf["ntfy_topic"] + "." if conf["ntfy_topic"] else ""),
-                             "good")
+                    self.sys.run(["chmod", "600", WATCH_CONF], root=True, quiet=True)
+                    msg = "✓ RAID Watch settings saved (used from its next check)."
+                    if conf["ntfy_topic"]:
+                        msg += "  Phone alerts go to ntfy topic " + conf["ntfy_topic"] + "."
+                    if conf["temp_alarm"]:
+                        msg += f"  Over-temperature alarm: drives {conf['temp_alarm_drive']} °C, Pi {conf['temp_alarm_cpu']} °C."
+                    self.log(msg, "good")
+                    if conf["web"]:
+                        rc, ips = self.sys.run(["hostname", "-I"], quiet=True)
+                        ip = (ips.split() or ["<this Pi's address>"])[0] if not DEMO else "192.168.1.50"
+                        self.log(f"  Web page: http://{ip}:{conf['web_port']}  (sign in with your password)", "good")
             self.work("saving RAID Watch settings", job)
         ttk.Button(bf, text="Save", style="Accent.TButton", command=save).pack(side="right")
         ttk.Button(bf, text="Cancel", command=win.destroy).pack(side="right", padx=8)

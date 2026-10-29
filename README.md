@@ -82,6 +82,27 @@ window opens when you log in, then hides itself while everything is healthy.
   `journalctl -u raidwatch`. Over SSH, `sudo python3 /opt/raidforge/raidwatch.py --once` prints the current state.
 - Try the window with a pretend failed drive: `python3 raidwatch.py --demo`
 
+**Over-temperature alarm (optional)**: in **Settings…**, tick *Sound the alarm if a drive or the Pi gets too hot*. RAID Watch
+then reads drive temperatures (and the Pi's processor) every 2 minutes. It **warns 5 °C before** the limit and **alarms at it**
+(defaults: drives 65 °C, Pi 80 °C; the Pi slows itself down at 85 °C). It doesn't flip-flop when sitting right at the limit, and
+a silenced warning alarms again if it gets worse.
+
+**Web page with a password (optional)**: tick *Show RAID Watch on a web page* in **Settings…**, choose a password (8+ characters)
+and open `http://<your-pi>:8484` from your phone or PC on the home network. It shows the status, temperatures, arrays and
+recent events, with **Silence alarm**, **Test alarm** and switches for the alarm sound, the green light and the
+over-temperature alarm.
+
+| | |
+|:---:|:---:|
+| ![RAID Watch web page](docs/raid-watch-web.png) | ![RAID Watch sign-in](docs/raid-watch-web-login.png) |
+
+- The password is stored only as a salted PBKDF2 hash, in `/etc/raidwatch.json`, which only admin can read.
+- Five wrong passwords lock that device out for 5 minutes. Sessions last 12 hours, and **Sign out** ends them.
+- Cookies are `HttpOnly` + `SameSite=Strict`, every button needs a per-session token, and the page can't be framed
+  by other sites.
+- It's plain HTTP, meant for your **home network only**. Don't forward its port to the internet. Use a VPN
+  (Tailscale / WireGuard) to check it from away.
+
 ## Hardware notes
 | Setup | Notes |
 |---|---|

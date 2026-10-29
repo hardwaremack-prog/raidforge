@@ -32,7 +32,7 @@ import threading
 import time
 
 APP = "RAID Watch"
-VERSION = "1.0"
+VERSION = "1.1"
 DEMO = "--demo" in sys.argv
 MDSTAT = os.environ.get("RAIDWATCH_MDSTAT", "/proc/mdstat")
 RUN_DIR = os.environ.get("RAIDWATCH_RUN", "/run/raidwatch")          # status.json + ack.json (shared with the window)
@@ -52,6 +52,10 @@ DEFAULTS = {
     "ntfy_server": "https://ntfy.sh",
     "ntfy_topic": "",            # set to get phone notifications with the free ntfy app (needs internet)
     "full_warn": 90, "full_crit": 98, "temp_warn": 60, "wear_warn": 80,
+    # over-temperature alarm (optional): checked every temp_interval_s instead of with SMART
+    "temp_alarm": False, "temp_alarm_drive": 65, "temp_alarm_cpu": 80, "temp_interval_s": 120,
+    # password-protected web page (optional)
+    "web": False, "web_port": 8484, "web_password": "",
 }
 LEVELS = {"ok": 0, "info": 1, "warn": 2, "crit": 3}
 
@@ -208,7 +212,7 @@ def check_smart(disks, smart, previous, conf, now=None):
         if j.get("smart_status", {}).get("passed") is False:
             alerts.append(("crit", f"smart:{n}", f"/dev/{n} says it is FAILING (SMART). Back up and replace it now."))
         temp = j.get("temperature", {}).get("current")
-        if temp and temp >= conf["temp_warn"]:
+        if temp and temp >= conf["temp_warn"] and not conf.get("temp_alarm"):
             alerts.append(("warn", f"temp:{n}", f"/dev/{n} is running hot: {temp} °C. Check its fan/airflow."))
         bad = 0
         for attr in j.get("ata_smart_attributes", {}).get("table", []):
@@ -239,6 +243,29 @@ def check_smart(disks, smart, previous, conf, now=None):
     return alerts, prev
 
 
+def check_temps(temps, cpu, conf, hot_before):
+    """Over-temperature alarm. temps: {disk: °C}, cpu: °C or None. hot_before: {id: level} from the last round.
+    Alarms at the limit, warns 5 °C below it, and only clears 3 °C under where it tripped (no flapping).
+    Returns (alerts, hot_now)."""
+    alerts, hot = [], {}
+    items = [(f"temp:{d}", f"/dev/{d}", c, conf["temp_alarm_drive"], "Check its fan/airflow and the case vents.")
+             for d, c in sorted(temps.items()) if c is not None]
+    if cpu is not None:
+        items.append(("temp:cpu", "The Pi's processor", cpu, conf["temp_alarm_cpu"],
+                      "Check the Pi's fan/heatsink. It slows itself down at 85 °C."))
+    for aid, what, c, limit, tip in items:
+        prev = hot_before.get(aid)
+        crit_at = limit - (3 if prev == "crit" else 0)
+        warn_at = limit - 5 - (3 if prev in ("warn", "crit") else 0)
+        if c >= crit_at:
+            hot[aid] = "crit"
+            alerts.append(("crit", aid, f"OVER TEMPERATURE: {what} is at {c:.0f} °C (alarm at {limit} °C). {tip}"))
+        elif c >= warn_at:
+            hot[aid] = "warn"
+            alerts.append(("warn", aid, f"{what} is getting hot: {c:.0f} °C (alarm at {limit} °C). {tip}"))
+    return alerts, hot
+
+
 def worst(alerts, infos):
     if any(a[0] == "crit" for a in alerts):
         return "crit"
@@ -261,6 +288,10 @@ class Daemon:
         self.smart_alerts = []
         self.smart_at = 0
         self.led = None                              # (path, original trigger) while flashing
+        self.temps, self.cpu, self.temps_at, self.hot = {}, None, 0, {}
+        self.lock = threading.Lock()                 # the web page can ask for a fresh check
+        self.web = None
+        run(["modprobe", "drivetemp"], timeout=10)   # lets SATA/USB drives report temperature without smartctl
         self.log(f"{APP} {VERSION} started")
 
     def log(self, msg):
@@ -331,6 +362,44 @@ class Daemon:
         self.smart_alerts, self.state["smart_prev"] = check_smart(disks, smart, self.state["smart_prev"], self.conf)
         self.smart_at = time.time()
 
+    def read_temps(self, arrays):
+        """Drive temperatures (hwmon first, smartctl if a drive has none) + the Pi's CPU temperature."""
+        names = {disk_of(d) for a in arrays for d, s in a["devices"]}
+        temps = {}
+        for hw in sorted(os.listdir("/sys/class/hwmon")) if os.path.isdir("/sys/class/hwmon") else []:
+            base = f"/sys/class/hwmon/{hw}"
+            kind = read(base + "/name").strip()
+            dev = os.path.realpath(base + "/device")
+            disk = None
+            if kind == "nvme":
+                m = re.search(r"/nvme/(nvme\d+)", dev) or re.search(r"(nvme\d+)$", dev)
+                ctrl = m.group(1) if m else ""
+                disk = next((n for n in names if n.startswith(ctrl + "n")), None) if ctrl else None
+            elif kind == "drivetemp":
+                blk = os.path.join(dev, "block")
+                disk = next(iter(os.listdir(blk)), None) if os.path.isdir(blk) else None
+            v = read(base + "/temp1_input").strip()
+            if disk in names and v.lstrip("-").isdigit():
+                temps[disk] = int(v) / 1000
+        if shutil.which("smartctl"):
+            for n in sorted(names - set(temps)):
+                rc, o = run(["smartctl", "-A", "-j", f"/dev/{n}"], timeout=30)
+                try:
+                    c = json.loads(o).get("temperature", {}).get("current")
+                except ValueError:
+                    c = None
+                if c is None:
+                    rc, o = run(["smartctl", "-d", "sat", "-A", "-j", f"/dev/{n}"], timeout=30)
+                    try:
+                        c = json.loads(o).get("temperature", {}).get("current")
+                    except ValueError:
+                        c = None
+                if c is not None:
+                    temps[n] = float(c)
+        v = read("/sys/class/thermal/thermal_zone0/temp").strip()
+        self.cpu = int(v) / 1000 if v.lstrip("-").isdigit() else None
+        self.temps, self.temps_at = temps, time.time()
+
     # ---- outputs
     def led_alarm(self, on):
         if not self.conf["led_alarm"]:
@@ -373,14 +442,44 @@ class Daemon:
                 self.log(f"phone push failed: {e}")
         threading.Thread(target=go, daemon=True).start()
 
+    def manage_web(self):
+        want = self.conf["web"] and bool(self.conf["web_password"])
+        if self.conf["web"] and not self.conf["web_password"]:
+            self.log("web page is on but has no password set, so it stays off")
+        if self.web and (not want or self.web.port != self.conf["web_port"]):
+            self.web.close()
+            self.web = None
+            self.log("web page stopped")
+        if want and not self.web:
+            try:
+                self.web = WebUI(self, self.conf["web_port"])
+                self.log(f"web page on port {self.conf['web_port']} (password protected)")
+            except OSError as e:
+                self.log(f"web page couldn't start on port {self.conf['web_port']}: {e}")
+
+    def refresh_now(self):
+        threading.Thread(target=self.tick, daemon=True).start()
+
     # ---- one round
     def tick(self):
+        with self.lock:
+            return self._tick()
+
+    def _tick(self):
         self.conf = load_conf()
+        self.manage_web()
         arrays = self.arrays()
         if time.time() - self.smart_at > self.conf["smart_hours"] * 3600:
             self.read_smart(arrays)
         alerts, infos, rows = check_arrays(arrays, self.configured_arrays(), read, self.mounts(arrays), self.conf)
         alerts += self.smart_alerts
+        if self.conf["temp_alarm"]:
+            if time.time() - self.temps_at > self.conf["temp_interval_s"]:
+                self.read_temps(arrays)
+            t_alerts, self.hot = check_temps(self.temps, self.cpu, self.conf, self.hot)
+            alerts += t_alerts
+        else:
+            self.hot = {}
         try:
             if time.time() - os.path.getmtime(TEST_FLAG) < 60:
                 alerts.append(("crit", "test", "TEST ALARM: this is only a test. Everything is fine."))
@@ -395,10 +494,6 @@ class Daemon:
         # acknowledgements from the window: drop stale ones, and expire after remind_hours (alarm again)
         ack = load_json(ACK, {})
         ack = {k: v for k, v in ack.items() if k in active and now - v < self.conf["remind_hours"] * 3600}
-        try:
-            write_json(ACK, ack, 0o666)
-        except OSError:
-            pass
 
         # new alerts -> events + push; cleared alerts -> recovery
         seen = self.state["seen"]
@@ -406,6 +501,11 @@ class Daemon:
         for lvl, aid, text in alerts:
             if aid not in seen:
                 seen[aid] = {"level": lvl, "since": now, "text": text}
+                self.event(lvl, text)
+                new.append((lvl, text))
+            elif LEVELS[lvl] > LEVELS[seen[aid]["level"]]:      # got worse: alarm again, even if silenced
+                seen[aid].update(level=lvl, text=text)
+                ack.pop(aid, None)
                 self.event(lvl, text)
                 new.append((lvl, text))
             else:
@@ -423,6 +523,10 @@ class Daemon:
                       "\n".join(t for _, t in sorted(new, key=lambda x: -LEVELS[x[0]])))
         if fixed:
             self.push("ok", "RAID back to normal" if not active else "RAID problem resolved", "\n".join(fixed))
+        try:
+            write_json(ACK, ack, 0o666)
+        except OSError:
+            pass
         unacked_crit = [aid for lvl, aid, _ in alerts if lvl == "crit" and aid not in ack]
         self.led_alarm(bool(unacked_crit))
         status = {
@@ -431,7 +535,10 @@ class Daemon:
             "alerts": [{"level": l, "id": i, "text": t, "since": seen[i]["since"], "acked": i in ack}
                        for l, i, t in sorted(alerts, key=lambda x: -LEVELS[x[0]])],
             "events": self.state["events"][-30:], "smart_checked": self.smart_at,
-            "sound": self.conf["sound"],
+            "sound": self.conf["sound"], "led_alarm": self.conf["led_alarm"],
+            "temp_alarm": self.conf["temp_alarm"], "temps": self.temps if self.conf["temp_alarm"] else {},
+            "cpu_temp": self.cpu if self.conf["temp_alarm"] else None,
+            "temp_limits": [self.conf["temp_alarm_drive"], self.conf["temp_alarm_cpu"]],
         }
         write_json(STATUS, status)
         write_json(os.path.join(STATE_DIR, "state.json"), self.state)
@@ -454,7 +561,247 @@ class Daemon:
                 self.log(f"check failed: {e}")
             self.stop.wait(self.conf["interval_s"])
         self.led_alarm(False)
+        if self.web:
+            self.web.close()
         self.log("stopped")
+
+
+# ================================================================== password-protected web page (optional)
+def make_hash(password, iterations=200_000):
+    import hashlib
+    salt = os.urandom(16)
+    h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
+    return f"pbkdf2_sha256${iterations}${salt.hex()}${h.hex()}"
+
+
+def check_hash(password, stored):
+    import hashlib
+    import hmac
+    try:
+        algo, it, salt, h = stored.split("$")
+        if algo != "pbkdf2_sha256":
+            return False
+        got = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), int(it))
+        return hmac.compare_digest(got.hex(), h)
+    except (ValueError, AttributeError):
+        return False
+
+
+def save_conf_key(key, value):
+    raw = load_json(CONF, {})
+    raw[key] = value
+    write_json(CONF, raw, 0o600)
+
+
+LOGIN_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>RAID Watch</title><style>
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0f1419;color:#e6edf3;
+font:16px/1.5 system-ui,"DejaVu Sans",sans-serif;padding:16px;box-sizing:border-box}
+form{background:#161d26;border:1px solid #2a3646;border-radius:16px;padding:26px;width:100%;max-width:340px}
+h1{margin:0 0 4px;font-size:22px} p{color:#8b98a9;margin:4px 0 16px;font-size:14px}
+input{width:100%;box-sizing:border-box;padding:12px;border-radius:10px;border:1px solid #2a3646;background:#0f1419;
+color:#e6edf3;font:inherit} button{margin-top:12px;width:100%;padding:12px;border:0;border-radius:10px;
+background:#c51a4a;color:#fff;font:inherit;font-weight:700;cursor:pointer} .err{color:#f85149;font-size:14px;min-height:20px}
+</style></head><body><form method="post" action="/login"><h1>RAID Watch</h1><p>%HOST%</p>
+<input type="password" name="password" placeholder="Password" autofocus autocomplete="current-password">
+<div class="err">%ERR%</div><button>Sign in</button></form></body></html>"""
+
+DASH_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>RAID Watch</title><style>
+:root{--bg:#0f1419;--panel:#161d26;--card:#1d2632;--line:#2a3646;--fg:#e6edf3;--mut:#8b98a9;
+--ok:#3fb950;--info:#58a6ff;--warn:#d29922;--crit:#f85149}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,"DejaVu Sans",sans-serif}
+main{max-width:720px;margin:0 auto;padding:16px}
+header{display:flex;align-items:center;gap:14px;margin:6px 0 14px}
+#lamp{width:44px;height:44px;border-radius:50%;background:var(--line);flex:none}
+h1{margin:0;font-size:22px} #sub{color:var(--mut);font-size:13px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px;margin:10px 0}
+.card h2{margin:0 0 8px;font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--mut)}
+.row{display:flex;gap:10px;align-items:flex-start;padding:6px 0} .dot{width:10px;height:10px;border-radius:50%;
+margin-top:6px;flex:none} .row.acked{opacity:.6} .mut{color:var(--mut)}
+button{appearance:none;border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:10px;
+padding:10px 14px;font:inherit;cursor:pointer} button.red{background:var(--crit);border-color:var(--crit);color:#fff;font-weight:700}
+.btns{display:flex;gap:8px;flex-wrap:wrap} .sw{display:flex;justify-content:space-between;align-items:center;
+padding:8px 0;border-top:1px solid var(--line)} .sw:first-of-type{border-top:0}
+.tog{flex:none;width:52px;height:30px;border-radius:15px;background:var(--line);position:relative;border:0;padding:0}
+.tog::after{content:"";position:absolute;top:3px;left:3px;width:24px;height:24px;border-radius:50%;background:#fff;transition:.15s}
+.tog.on{background:var(--ok)} .tog.on::after{left:25px}
+.temps{display:flex;gap:8px;flex-wrap:wrap} .t{background:var(--card);border-radius:10px;padding:6px 10px;font-size:14px}
+body.alarm{animation:fl 1s steps(1) infinite} @keyframes fl{50%{background:#3a1216}}
+footer{display:flex;justify-content:space-between;color:var(--mut);font-size:13px;margin-top:14px}
+footer form button{padding:6px 10px;font-size:13px}
+</style></head><body><main>
+<header><div id="lamp"></div><div><h1 id="head">Loading…</h1><div id="sub"></div></div></header>
+<div class="card"><h2>Status</h2><div id="list"></div><div class="btns" style="margin-top:10px">
+<button class="red" id="sil" hidden>Silence alarm</button><button id="test">Test alarm</button></div></div>
+<div class="card" id="tcard" hidden><h2>Temperatures</h2><div class="temps" id="temps"></div></div>
+<div class="card"><h2>Arrays</h2><div id="arrays"></div></div>
+<div class="card"><h2>Settings</h2>
+<div class="sw"><span>Alarm sound on the Pi</span><button class="tog" data-k="sound"></button></div>
+<div class="sw"><span>Flash the Pi's green light</span><button class="tog" data-k="led_alarm"></button></div>
+<div class="sw"><span>Over-temperature alarm <span class="mut" id="lim"></span></span><button class="tog" data-k="temp_alarm"></button></div>
+</div>
+<div class="card"><h2>Recent</h2><div id="events"></div></div>
+<footer><span id="ver"></span><form method="post" action="/logout"><input type="hidden" name="csrf" value="%CSRF%"><button>Sign out</button></form></footer>
+</main><script>
+const CSRF="%CSRF%", C={ok:"var(--ok)",info:"var(--info)",warn:"var(--warn)",crit:"var(--crit)"};
+const W={ok:"All RAID arrays healthy",info:"Healthy, working on something",warn:"Needs a look",crit:"RAID NEEDS SERVICE"};
+const $=id=>document.getElementById(id);
+function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e}
+function row(level,text,acked){const r=el("div","row"+(acked?" acked":""));const d=el("span","dot");d.style.background=C[level];
+ r.append(d,el("span","",text+(acked?"  (silenced)":"")));return r}
+async function api(path,body){const r=await fetch(path,{method:body?"POST":"GET",headers:{"X-CSRF":CSRF,
+ "Content-Type":"application/json"},body:body?JSON.stringify(body):undefined,credentials:"same-origin"});
+ if(r.status===401){location.reload();return null} return r.json()}
+async function load(){const s=await api("/api/status");if(!s)return;
+ const lv=s.level, un=(s.alerts||[]).some(a=>a.level==="crit"&&!a.acked);
+ $("head").textContent=W[lv]||lv;$("head").style.color=lv==="ok"?"":C[lv];$("lamp").style.background=C[lv];
+ $("sub").textContent=s.host+" · checked "+new Date(s.time*1000).toLocaleTimeString();
+ document.body.classList.toggle("alarm",un);$("sil").hidden=!(s.alerts||[]).some(a=>!a.acked);
+ const L=$("list");L.replaceChildren();(s.alerts||[]).forEach(a=>L.append(row(a.level,a.text,a.acked)));
+ (s.infos||[]).forEach(i=>L.append(row("info",i)));if(!L.children.length)L.append(row("ok","Everything is healthy."));
+ const A=$("arrays");A.replaceChildren();(s.arrays||[]).forEach(r=>A.append(row(r.state==="DEGRADED"?"crit":"ok",
+  r.label+"  "+r.level.toUpperCase()+" ["+r.health+"]  "+(r.mount||"not mounted")+(r.used!=null?", "+r.used.toFixed(0)+"% full":""))));
+ if(!A.children.length)A.append(el("div","mut","No RAID arrays yet."));
+ const T=$("temps");T.replaceChildren();const ts=Object.entries(s.temps||{});
+ if(s.cpu_temp!=null)ts.unshift(["CPU",s.cpu_temp]);ts.forEach(([k,v])=>T.append(el("span","t",k+" "+Math.round(v)+" °C")));
+ $("tcard").hidden=!ts.length;$("lim").textContent=s.temp_limits?"(drives "+s.temp_limits[0]+" °C, CPU "+s.temp_limits[1]+" °C)":"";
+ document.querySelectorAll(".tog").forEach(b=>b.classList.toggle("on",!!s[b.dataset.k]));
+ const E=$("events");E.replaceChildren();(s.events||[]).slice(-6).reverse().forEach(e=>E.append(row(e.level,
+  new Date(e.time*1000).toLocaleString([], {weekday:"short",hour:"2-digit",minute:"2-digit"})+"  "+e.text)));
+ $("ver").textContent="RAID Watch "+s.version}
+$("sil").onclick=async()=>{await api("/api/silence",{});load()};
+$("test").onclick=async()=>{$("test").textContent="Test sent…";await api("/api/test",{});setTimeout(()=>{$("test").textContent="Test alarm";load()},1500)};
+document.querySelectorAll(".tog").forEach(b=>b.onclick=async()=>{await api("/api/toggle",{key:b.dataset.k});load()});
+load();setInterval(()=>{if(!document.hidden)load()},5000);
+</script></body></html>"""
+
+
+class WebUI:
+    """Small password-protected status page for phones/PCs on the home network."""
+    TOGGLES = ("sound", "led_alarm", "temp_alarm")
+
+    def __init__(self, daemon, port):
+        import http.server
+        import secrets
+        self.d, self.port = daemon, port
+        self.sessions, self.fails = {}, {}
+        web = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            server_version = "RAIDWatch"
+            sys_version = ""
+
+            def log_message(self, *a):
+                pass
+
+            def send(self, code, body, ctype="text/html; charset=utf-8", headers=()):
+                data = body.encode() if isinstance(body, str) else body
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Frame-Options", "DENY")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("Content-Security-Policy",
+                                 "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+                                 "connect-src 'self'; form-action 'self'; frame-ancestors 'none'")
+                for k, v in headers:
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(data)
+
+            def session(self):
+                m = re.search(r"(?:^|;\s*)rw_session=([A-Za-z0-9_-]+)", self.headers.get("Cookie", ""))
+                s = web.sessions.get(m.group(1)) if m else None
+                if s and s["exp"] > time.time():
+                    return m.group(1), s
+                return None, None
+
+            def body(self):
+                n = min(int(self.headers.get("Content-Length") or 0), 4096)
+                return self.rfile.read(n).decode("utf-8", "replace")
+
+            def login_page(self, err="", code=200):
+                html = LOGIN_HTML.replace("%HOST%", os.uname().nodename).replace("%ERR%", err)
+                self.send(code, html)
+
+            def do_GET(self):
+                tok, s = self.session()
+                if self.path == "/":
+                    return self.send(200, DASH_HTML.replace("%CSRF%", s["csrf"])) if s else self.login_page()
+                if self.path == "/api/status":
+                    if not s:
+                        return self.send(401, "{}", "application/json")
+                    return self.send(200, json.dumps(load_json(STATUS, {})), "application/json")
+                self.send(404, "Not found", "text/plain")
+
+            def do_POST(self):
+                ip = self.client_address[0]
+                if self.path == "/login":
+                    f = web.fails.get(ip, {"n": 0, "until": 0})
+                    if f["until"] > time.time():
+                        return self.login_page(f"Too many wrong passwords. Try again in "
+                                               f"{int(f['until'] - time.time()) // 60 + 1} min.", 429)
+                    from urllib.parse import parse_qs
+                    pw = parse_qs(self.body()).get("password", [""])[0]
+                    stored = load_conf().get("web_password", "")
+                    if stored and check_hash(pw, stored):
+                        web.fails.pop(ip, None)
+                        tok = secrets.token_urlsafe(32)
+                        web.sessions[tok] = {"exp": time.time() + 12 * 3600, "csrf": secrets.token_urlsafe(24)}
+                        web.d.log(f"web: signed in from {ip}")
+                        return self.send(303, "", headers=(("Location", "/"), (
+                            "Set-Cookie", f"rw_session={tok}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200")))
+                    f["n"] += 1
+                    if f["n"] >= 5:
+                        f = {"n": 0, "until": time.time() + 300}
+                        web.d.log(f"web: 5 wrong passwords from {ip}, locked for 5 minutes")
+                    web.fails[ip] = f
+                    time.sleep(1)                                   # slow down guessing
+                    return self.login_page("Wrong password.", 401)
+                tok, s = self.session()
+                if self.path == "/logout":
+                    from urllib.parse import parse_qs
+                    if s and parse_qs(self.body()).get("csrf", [""])[0] == s["csrf"]:
+                        web.sessions.pop(tok, None)
+                    return self.send(303, "", headers=(("Location", "/"),
+                                                       ("Set-Cookie", "rw_session=; Path=/; Max-Age=0")))
+                if not s:
+                    return self.send(401, "{}", "application/json")
+                if self.headers.get("X-CSRF") != s["csrf"]:
+                    return self.send(403, '{"error":"bad token"}', "application/json")
+                try:
+                    data = json.loads(self.body() or "{}")
+                except ValueError:
+                    data = {}
+                if self.path == "/api/silence":
+                    st = load_json(STATUS, {})
+                    ack = load_json(ACK, {})
+                    ack.update({a["id"]: time.time() for a in st.get("alerts", [])})
+                    write_json(ACK, ack, 0o666)
+                    web.d.log(f"web: alarm silenced from {ip}")
+                elif self.path == "/api/test":
+                    with open(TEST_FLAG, "w") as f:
+                        f.write("web\n")
+                    web.d.log(f"web: test alarm from {ip}")
+                elif self.path == "/api/toggle" and data.get("key") in WebUI.TOGGLES:
+                    k = data["key"]
+                    save_conf_key(k, not load_conf()[k])
+                    web.d.log(f"web: {k} turned {'on' if load_conf()[k] else 'off'} from {ip}")
+                else:
+                    return self.send(404, "{}", "application/json")
+                web.d.refresh_now()
+                self.send(200, '{"ok":true}', "application/json")
+
+        self.httpd = http.server.ThreadingHTTPServer(("", port), H)
+        self.httpd.daemon_threads = True
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
 
 
 # ================================================================== the window (your desktop)
@@ -518,7 +865,8 @@ def demo_status():
             "events": [{"time": now - 86400, "level": "ok", "text": "RAID Watch started"},
                        {"time": now - 3600, "level": "warn", "text": "/dev/md/media (/mnt/media) is 91% full."},
                        {"time": now - 300, "level": "crit", "text": "/dev/md/vault: drive /dev/sdb failed."}],
-            "smart_checked": now - 1800}
+            "smart_checked": now - 1800, "temp_alarm": True, "temps": {"sda": 44.0, "sdb": 46.0},
+            "cpu_temp": 57.3, "temp_limits": [65, 80]}
 
 
 def window():
@@ -611,6 +959,12 @@ def window():
                 body.insert("end", f"{r['level'].upper()} [{r['health']}]  {r['mount'] or 'not mounted'}{used}\n")
             if not s.get("arrays"):
                 body.insert("end", "No RAID arrays on this Pi yet. Build one in RAID Forge.\n", "muted")
+        temps = list((s.get("temps") or {}).items())
+        if s.get("cpu_temp") is not None:
+            temps.insert(0, ("CPU", s["cpu_temp"]))
+        if temps:
+            body.insert("end", "\nTemperatures  ", "muted")
+            body.insert("end", "  ·  ".join(f"{k} {v:.0f} °C" for k, v in temps) + "\n")
         ev = s.get("events", [])[-4:]
         if ev:
             body.insert("end", "\nRecent\n", "muted")
