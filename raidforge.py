@@ -23,7 +23,7 @@ import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 
 APP = "RAID Forge"
-VERSION = "1.5"
+VERSION = "1.6"
 DEMO = "--demo" in sys.argv or os.environ.get("RAIDFORGE_DEMO") == "1"
 USER = os.environ.get("SUDO_USER") or getpass.getuser()
 
@@ -215,6 +215,16 @@ HATS = [
     ("Quad NVMe HAT (PCIe switch)", "Up to 4 NVMe drives behind a PCIe switch. Use PCIe Gen 2."),
     ("USB 3 drives / USB HAT / dock", "Works on Pi 5, Pi 500 and Pi 400 (blue USB 3 ports). Use a powered hub or dock for 2.5\"/3.5\" drives."),
 ]
+
+
+def free_text(space):
+    """'1.6 TB free of 3.9 TB (60%) ▕██████░░░░▏' style text for the arrays table."""
+    if not space or not space[1]:
+        return "— (not mounted)"
+    free, total = space
+    pct = 100 * free / total
+    used = round((100 - pct) / 10)
+    return f"{human(free)} free ({pct:.0f}%)  " + "█" * used + "░" * (10 - used)
 
 
 def human(n):
@@ -477,6 +487,18 @@ class System:
         except OSError:
             pass
         return f"/dev/{mdname}"
+
+    def space(self, mount):
+        """(free_bytes, total_bytes) of a mounted filesystem, or None."""
+        if DEMO and mount:
+            return (1_558_000_000_000, 3_940_000_000_000)
+        if not mount:
+            return None
+        try:
+            st = os.statvfs(mount)
+        except OSError:
+            return None
+        return (st.f_bavail * st.f_frsize, st.f_blocks * st.f_frsize)
 
     def mountpoint_of(self, dev):
         if DEMO:
@@ -1170,10 +1192,10 @@ class App(tk.Tk):
         top.pack(fill="x", pady=(10, 6))
         ttk.Button(top, text="↻ Refresh", command=self.refresh_all).pack(side="left")
         ttk.Button(top, text="Find & start existing arrays", command=self.assemble).pack(side="left", padx=6)
-        cols = ("dev", "level", "size", "health", "state", "mount", "progress")
+        cols = ("dev", "level", "size", "free", "health", "state", "mount", "progress")
         self.atree = ttk.Treeview(root, columns=cols, show="headings", height=6, selectmode="browse")
-        for c, t, w in zip(cols, ("Array", "Level", "Size", "Drives", "State", "Mounted at", "Activity"),
-                           (180, 70, 100, 110, 140, 160, 260)):
+        for c, t, w in zip(cols, ("Array", "Level", "Size", "Free space", "Drives", "State", "Mounted at", "Activity"),
+                           (170, 60, 85, 190, 100, 110, 130, 230)):
             self.atree.heading(c, text=t)
             self.atree.column(c, width=w, anchor="w")
         self.atree.pack(fill="x")
@@ -1239,13 +1261,16 @@ class App(tk.Tk):
                 if a["finish"]:
                     act += f"  ~{a['finish']}  {a['speed']}"
                 best = best or a
-            tag = "bad" if degraded or a["state"] != "active" else ("warn" if a["op"] else "good")
+            sp = a.get("space")
+            low = sp and sp[1] and sp[0] / sp[1] * 100
+            tag = "bad" if degraded or a["state"] != "active" or (sp and low < 2) else \
+                ("warn" if a["op"] or (sp and low < 10) else "good")
             self.atree.insert("", "end", iid=a["name"], tags=(tag,),
                               values=(f"{a['alias']}  ({a['name']})", a["level"].upper(),
-                                      human(a["size"]) if a["size"] else "—", drives, state,
+                                      human(a["size"]) if a["size"] else "—", free_text(a.get("space")), drives, state,
                                       a["mount"] or "not mounted", act or "idle ✓"))
         if not arrays:
-            self.atree.insert("", "end", iid="_none", values=("No arrays yet — build one on tab ①", "", "", "", "", "", ""))
+            self.atree.insert("", "end", iid="_none", values=("No arrays yet — build one on tab ①", "", "", "", "", "", "", ""))
         if sel and self.atree.exists(sel):
             self.atree.selection_set(sel)
         elif arrays and not self.atree.selection():
@@ -2430,6 +2455,7 @@ Categories=System;Monitor;
         for a in arrays:
             a["alias"] = self.sys.md_alias(a["name"])
             a["mount"] = self.sys.mountpoint_of(f"/dev/{a['name']}")
+            a["space"] = self.sys.space(a["mount"])
         return arrays
 
     def _auto_refresh(self):

@@ -32,7 +32,7 @@ import threading
 import time
 
 APP = "RAID Watch"
-VERSION = "1.1"
+VERSION = "1.2"
 DEMO = "--demo" in sys.argv
 MDSTAT = os.environ.get("RAIDWATCH_MDSTAT", "/proc/mdstat")
 RUN_DIR = os.environ.get("RAIDWATCH_RUN", "/run/raidwatch")          # status.json + ack.json (shared with the window)
@@ -133,6 +133,14 @@ def parse_mdstat(text):
     return arrays
 
 
+def human_bytes(n):
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
+        if n < 1000 or unit == "PB":
+            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
+        n /= 1000
+
+
 def nice_minutes(m):
     try:
         m = float(m)
@@ -181,7 +189,8 @@ def check_arrays(arrays, configured, sysread, mounts, conf):
             alerts.append(("warn", f"mismatch:{n}",
                            f"{label}: the last data check found {mc} mismatched blocks. Run 'Scrub' again; "
                            "if it keeps happening, check the drives' health."))
-        mp, used = mounts.get(n, ("", None))
+        m = tuple(mounts.get(n, ()))
+        mp, used, free, total = (m + ("", None, None, None)[len(m):])[:4]
         if used is not None:
             if used >= conf["full_crit"]:
                 alerts.append(("crit", f"full:{n}", f"{label} ({mp}) is {used:.0f}% full. Free up space now."))
@@ -189,7 +198,7 @@ def check_arrays(arrays, configured, sysread, mounts, conf):
                 alerts.append(("warn", f"full:{n}", f"{label} ({mp}) is {used:.0f}% full."))
         rows.append(dict(name=n, label=label, level=a["level"], state="DEGRADED" if degraded else a["state"],
                          health=a["health"], op=a["op"], pct=a["pct"], finish=a.get("finish", ""),
-                         mount=mp, used=used, failed=failed, spares=spares))
+                         mount=mp, used=used, free=free, total=total, failed=failed, spares=spares))
     running = {a.get("uuid") for a in arrays if a.get("uuid")}
     for uuid, name in configured:
         if uuid not in running:
@@ -335,7 +344,7 @@ class Daemon:
                 st = os.statvfs(mp)
                 total = st.f_blocks * st.f_frsize
                 used = (st.f_blocks - st.f_bfree) * st.f_frsize
-                out[a["name"]] = (mp, 100.0 * used / total if total else None)
+                out[a["name"]] = (mp, 100.0 * used / total if total else None, st.f_bavail * st.f_frsize, total)
         return out
 
     def read_smart(self, arrays):
@@ -647,6 +656,7 @@ footer form button{padding:6px 10px;font-size:13px}
 const CSRF="%CSRF%", C={ok:"var(--ok)",info:"var(--info)",warn:"var(--warn)",crit:"var(--crit)"};
 const W={ok:"All RAID arrays healthy",info:"Healthy, working on something",warn:"Needs a look",crit:"RAID NEEDS SERVICE"};
 const $=id=>document.getElementById(id);
+function hb(n){const u=["B","KB","MB","GB","TB","PB"];let i=0;while(n>=1000&&i<5){n/=1000;i++}return n.toFixed(i<2?0:1)+" "+u[i]}
 function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e}
 function row(level,text,acked){const r=el("div","row"+(acked?" acked":""));const d=el("span","dot");d.style.background=C[level];
  r.append(d,el("span","",text+(acked?"  (silenced)":"")));return r}
@@ -661,7 +671,7 @@ async function load(){const s=await api("/api/status");if(!s)return;
  const L=$("list");L.replaceChildren();(s.alerts||[]).forEach(a=>L.append(row(a.level,a.text,a.acked)));
  (s.infos||[]).forEach(i=>L.append(row("info",i)));if(!L.children.length)L.append(row("ok","Everything is healthy."));
  const A=$("arrays");A.replaceChildren();(s.arrays||[]).forEach(r=>A.append(row(r.state==="DEGRADED"?"crit":"ok",
-  r.label+"  "+r.level.toUpperCase()+" ["+r.health+"]  "+(r.mount||"not mounted")+(r.used!=null?", "+r.used.toFixed(0)+"% full":""))));
+  r.label+"  "+r.level.toUpperCase()+" ["+r.health+"]  "+(r.mount||"not mounted")+(r.free!=null?", "+hb(r.free)+" free of "+hb(r.total)+" ("+(100-r.used).toFixed(0)+"%)":r.used!=null?", "+r.used.toFixed(0)+"% full":""))));
  if(!A.children.length)A.append(el("div","mut","No RAID arrays yet."));
  const T=$("temps");T.replaceChildren();const ts=Object.entries(s.temps||{});
  if(s.cpu_temp!=null)ts.unshift(["CPU",s.cpu_temp]);ts.forEach(([k,v])=>T.append(el("span","t",k+" "+Math.round(v)+" °C")));
@@ -848,11 +858,11 @@ def demo_status():
     now = time.time()
     return {"time": now, "level": "crit", "host": "pi5", "version": VERSION, "sound": True,
             "arrays": [{"name": "md127", "label": "/dev/md/vault", "level": "raid1", "state": "DEGRADED",
-                        "health": "U_", "op": "", "pct": None, "finish": "", "mount": "/mnt/vault", "used": 61.2,
+                        "health": "U_", "op": "", "pct": None, "finish": "", "mount": "/mnt/vault", "used": 61.2, "free": 1_529_000_000_000, "total": 3_940_000_000_000,
                         "failed": ["sdb"], "spares": []},
                        {"name": "md126", "label": "/dev/md/media", "level": "raid5", "state": "active",
                         "health": "UUU", "op": "check", "pct": 42.0, "finish": "38", "mount": "/mnt/media",
-                        "used": 91.4, "failed": [], "spares": []}],
+                        "used": 91.4, "free": 516_000_000_000, "total": 6_000_000_000_000, "failed": [], "spares": []}],
             "infos": ["/dev/md/media: Checking 42.0%, about 38 min left"],
             "alerts": [{"level": "crit", "id": "failed:md127", "acked": False, "since": now - 300,
                         "text": "/dev/md/vault: drive /dev/sdb failed. Replace it soon (RAID Forge > My Arrays > "
@@ -880,7 +890,7 @@ def window():
     wav = alarm_wav(os.path.expanduser("~/.cache/raidwatch/alarm.wav"))
     root = tk.Tk()
     root.title(APP + (" (demo)" if DEMO else ""))
-    root.geometry("460x330")
+    root.geometry("480x430")
     root.minsize(380, 260)
     root.configure(bg=BG)
     try:
@@ -953,12 +963,18 @@ def window():
             body.insert("end", i + "\n\n")
         if not s.get("alerts"):
             for r in s.get("arrays", []):
-                used = f", {r['used']:.0f}% full" if r.get("used") is not None else ""
+                used = (f", {human_bytes(r['free'])} free of {human_bytes(r['total'])}" if r.get("free") is not None
+                        else f", {r['used']:.0f}% full" if r.get("used") is not None else "")
                 body.insert("end", "● ", "ok")
                 body.insert("end", f"{r['label']}  ", "bold")
                 body.insert("end", f"{r['level'].upper()} [{r['health']}]  {r['mount'] or 'not mounted'}{used}\n")
             if not s.get("arrays"):
                 body.insert("end", "No RAID arrays on this Pi yet. Build one in RAID Forge.\n", "muted")
+        spaced = [r for r in s.get("arrays", []) if r.get("free") is not None]
+        if s.get("alerts") and spaced:
+            body.insert("end", "\nFree space  ", "muted")
+            body.insert("end", "  ·  ".join(f"{r['label'].split('/')[-1]} {human_bytes(r['free'])} "
+                                            f"({100 - r['used']:.0f}%)" for r in spaced) + "\n")
         temps = list((s.get("temps") or {}).items())
         if s.get("cpu_temp") is not None:
             temps.insert(0, ("CPU", s["cpu_temp"]))

@@ -29,7 +29,7 @@ Then open **Menu → System Tools → RAID Forge**. Use **RAID Forge (Demo)** fi
 - Name it, choose a mount folder, ext4 or XFS, chunk size, and whether it auto-mounts at boot
 - Type `ERASE` to confirm → wipes, creates the array, formats (stripe-aligned), mounts, writes `mdadm.conf` + `fstab` (`nofail`, so the Pi still boots if the HAT is unplugged), updates initramfs
 
-**② My Arrays** — live status every 3 s with sync/rebuild progress, details, scrub, speed test, replace a failed drive, add a hot spare, stop, re-assemble, delete (also cleans up fstab/mdadm.conf)
+**② My Arrays** — live status every 3 s with **free space** (amber under 10%, red under 2%), sync/rebuild progress, details, scrub, speed test, replace a failed drive, add a hot spare, stop, re-assemble, delete (also cleans up fstab/mdadm.conf)
 
 **Move system to RAID** (on My Arrays) — runs the whole system from the array; the SD card only starts the Pi
 - Checks first: system is on the SD card, array is healthy and big enough, startup files (initramfs) can find RAID
